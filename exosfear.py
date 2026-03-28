@@ -1,6 +1,6 @@
-# grow_graph.py — a self-growing knowledge graph of neural nets (FIXED)
-#
-# pip install torch && python grow_graph.py
+# exosfear.py — a self-growing knowledge graph of neural nets (FIXED)
+# warning - i did not complete the run and it locked up my computer. so review and use with extreme caution if at all 
+# pip install torch && python exosfear.py
 
 import torch, torch.nn as nn, torch.nn.functional as F, os, random
 
