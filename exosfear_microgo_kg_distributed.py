@@ -2,41 +2,44 @@
 """
 EXOSFEAR MicroGo KG Distributed
 
+new
+
 One-file distributed self-play training lab for 6x6 Micro Go.
 Each side is a small graph-team of specialist node-nets:
   opening, tactics, territory, endgame
 
-Workers auto-discover the coordinator via UDP broadcast beacon.
-Start coordinator on one machine, worker on another — they find each other.
+Architecture follows the proven MiniLab distributed pattern:
+- Workers are HTTP servers that sit and wait for work
+- Coordinator scans LAN to find workers, pushes jobs via HTTP POST
+- Start workers first, then coordinator
+- Coordinator also runs as a local worker by default
 
-High risk warning:
-- Self-play + MCTS + training can heavily load CPU/GPU.
-- Start tiny. Review settings before serious runs.
-- Windows Firewall: allow Python through when prompted on first run.
+Dependencies: pip install torch numpy
 """
 from __future__ import annotations
 
 import argparse
 import base64
-from dataclasses import dataclass, field
+import concurrent.futures
+from dataclasses import dataclass, field, asdict
 import gzip
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import os
 from pathlib import Path
 import pickle
-import queue
 import random
+import secrets
 import socket
-import struct
 import sys
 import threading
 import time
+from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional, Tuple
-from urllib import request as urllib_request
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -59,295 +62,218 @@ BOARD_SIZE = 6
 PASS_MOVE = BOARD_SIZE * BOARD_SIZE
 ALL_MOVES = BOARD_SIZE * BOARD_SIZE + 1
 KOMI = 3.5
-DEFAULT_WORKER_PORT = 8786
-DEFAULT_COORD_PORT = 8787
-BEACON_PORT = 9876
-BEACON_MAGIC = "EXOSFEAR_MICROGO_V1"
 MAX_GAME_LEN = 120
 SEED = 42
 EXPERT_NAMES = ["opening", "tactics", "territory", "endgame"]
 
 
-# ── missing helpers ────────────────────────────────────────────────────
-class ReusableThreadingHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
+# ── io helpers ─────────────────────────────────────────────────────────
+def section(title: str) -> None:
+    print("=" * 70)
+    print(f"  {title}")
+    print("=" * 70)
 
 
-def close_server(server: ThreadingHTTPServer) -> None:
-    try:
-        server.shutdown()
-    except Exception:
-        pass
+def short_line(title: str) -> None:
+    print(f"--- {title} {'-' * max(1, 64 - len(title))}")
 
 
-# ── beacon: coordinator broadcasts, worker listens ────────────────────
-def start_beacon(coord_url: str, token: str, interval: float = 2.0) -> threading.Thread:
-    """Coordinator broadcasts its address + token on LAN via UDP every interval seconds."""
-    msg = json.dumps({
-        "magic": BEACON_MAGIC,
-        "coord_url": coord_url,
-        "token": token,
-    }).encode("utf-8")
-
-    def _loop():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        # Also try to set SO_REUSEADDR so multiple runs don't collide
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        while True:
-            try:
-                sock.sendto(msg, ("255.255.255.255", BEACON_PORT))
-            except Exception:
-                pass
-            # Also try subnet-directed broadcast for every local interface
-            for ip in local_ipv4_addresses():
-                if ip.startswith("127."):
-                    continue
-                parts = ip.split(".")
-                if len(parts) == 4:
-                    bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
-                    try:
-                        sock.sendto(msg, (bcast, BEACON_PORT))
-                    except Exception:
-                        pass
-            time.sleep(interval)
-
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
-    return t
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
-def discover_coordinator(timeout: float = 120.0) -> Tuple[Optional[str], Optional[str]]:
-    """Worker listens for coordinator beacon on UDP. Returns (coord_url, token) or (None, None)."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    except Exception:
-        pass
-    try:
-        sock.bind(("0.0.0.0", BEACON_PORT))
-    except OSError as exc:
-        print(f"  Warning: could not bind UDP port {BEACON_PORT}: {exc}")
-        print(f"  Trying alternative port...")
-        try:
-            sock.bind(("0.0.0.0", BEACON_PORT + 1))
-        except OSError:
-            print(f"  Could not bind beacon listener. Enter coordinator URL manually.")
-            sock.close()
-            return None, None
-    sock.settimeout(3.0)
-    deadline = time.time() + timeout
-    print(f"\n  Listening for coordinator beacon (UDP port {BEACON_PORT})...")
-    print(f"  Make sure the coordinator is running on another machine.")
-    print(f"  Windows/macOS: allow Python through firewall when prompted!\n")
-    last_print = 0
-    while time.time() < deadline:
-        remaining = int(deadline - time.time())
-        try:
-            data, addr = sock.recvfrom(4096)
-            msg = json.loads(data.decode("utf-8"))
-            if msg.get("magic") == BEACON_MAGIC:
-                coord_url = msg["coord_url"]
-                token = msg["token"]
-                print(f"\n  ✓ Found coordinator at {coord_url}  (beacon from {addr[0]})")
-                sock.close()
-                return coord_url, token
-        except socket.timeout:
-            now = time.time()
-            if now - last_print > 3:
-                print(f"  Scanning... {remaining}s remaining  ", end="\r", flush=True)
-                last_print = now
-        except Exception:
-            pass
-    print(f"\n  No coordinator beacon found within {int(timeout)}s.")
-    sock.close()
-    return None, None
-
-
-def verify_coordinator(coord_url: str, token: str) -> bool:
-    """Quick HTTP check that coordinator is reachable and token matches."""
-    try:
-        resp = http_get_json(coord_url.rstrip("/") + "/health", timeout=5.0)
-        if resp.get("ok"):
-            print(f"  ✓ Coordinator responding at {coord_url}")
-            return True
-    except Exception as exc:
-        print(f"  ✗ Cannot reach coordinator at {coord_url}: {exc}")
-    return False
-
-
-# ── utilities ──────────────────────────────────────────────────────────
-def set_global_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def safe_json_dump(path: Path, obj: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def json_dump(data: Any, path: Path) -> None:
+    ensure_dir(path.parent)
     with path.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2)
-
-
-def save_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def now_ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+def sha256_short(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def compress_obj(obj: Any) -> str:
     raw = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-    comp = gzip.compress(raw)
-    return base64.b64encode(comp).decode("ascii")
+    return base64.b64encode(gzip.compress(raw)).decode("ascii")
 
 
 def decompress_obj(s: str) -> Any:
-    comp = base64.b64decode(s.encode("ascii"))
-    raw = gzip.decompress(comp)
-    return pickle.loads(raw)
+    return pickle.loads(gzip.decompress(base64.b64decode(s.encode("ascii"))))
 
 
-def free_port(preferred: int = DEFAULT_WORKER_PORT) -> int:
-    for p in range(preferred, preferred + 200):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind(("0.0.0.0", p))
-                return p
-            except OSError:
-                continue
-    raise RuntimeError("Could not find a free port")
-
-
-def local_ipv4_addresses() -> List[str]:
-    addrs = {"127.0.0.1"}
-    try:
-        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM)
-        for info in infos:
-            ip = info[4][0]
-            if not ip.startswith("127."):
-                addrs.add(ip)
-    except Exception:
-        pass
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        addrs.add(s.getsockname()[0])
-        s.close()
-    except Exception:
-        pass
-    return sorted(addrs)
-
-
-def my_lan_ip() -> str:
-    for ip in local_ipv4_addresses():
-        if not ip.startswith("127."):
-            return ip
-    return "127.0.0.1"
-
-
-def choose_device(default_cuda: bool = True) -> str:
-    return "cuda" if default_cuda and torch.cuda.is_available() else "cpu"
-
-
-def prompt_default(prompt: str, default: str) -> str:
-    try:
-        raw = input(f"{prompt} [{default}]: ").strip()
-        return raw if raw else default
-    except (EOFError, KeyboardInterrupt):
-        return default
-
-
-def prompt_int(prompt: str, default: int, min_value: Optional[int] = None) -> int:
+# ── prompts ────────────────────────────────────────────────────────────
+def prompt_int(label: str, default: int, min_v: Optional[int] = None, max_v: Optional[int] = None) -> int:
     while True:
         try:
-            raw = input(f"{prompt} [{default}]: ").strip()
+            raw = input(f"{label} [{default}]: ").strip()
         except (EOFError, KeyboardInterrupt):
             return default
         if not raw:
             return default
         try:
             v = int(raw)
-            if min_value is not None and v < min_value:
-                print(f"  >= {min_value} required")
-                continue
-            return v
         except ValueError:
-            print("  integer required")
+            print("  integer required"); continue
+        if min_v is not None and v < min_v:
+            print(f"  must be >= {min_v}"); continue
+        if max_v is not None and v > max_v:
+            print(f"  must be <= {max_v}"); continue
+        return v
 
 
-def prompt_float(prompt: str, default: float, min_value: Optional[float] = None) -> float:
-    while True:
-        try:
-            raw = input(f"{prompt} [{default}]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return default
-        if not raw:
-            return default
-        try:
-            v = float(raw)
-            if min_value is not None and v < min_value:
-                print(f"  >= {min_value} required")
-                continue
-            return v
-        except ValueError:
-            print("  number required")
-
-
-def prompt_yes_no(prompt: str, default_yes: bool = True) -> bool:
-    tag = "Y/n" if default_yes else "y/N"
+def prompt_bool(label: str, default: bool = True) -> bool:
+    tag = "Y/n" if default else "y/N"
     try:
-        raw = input(f"{prompt} [{tag}]: ").strip().lower()
+        raw = input(f"{label} [{tag}]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
-        return default_yes
+        return default
     if not raw:
-        return default_yes
-    return raw.startswith("y")
+        return default
+    return raw in {"y", "yes", "1", "true"}
 
 
-def gen_token() -> str:
-    return sha256_text(str(time.time()) + str(random.random()))
+def prompt_str(label: str, default: str) -> str:
+    try:
+        raw = input(f"{label} [{default}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    return raw or default
 
 
-# ── HTTP helpers ───────────────────────────────────────────────────────
-def maybe_json_response(handler: BaseHTTPRequestHandler, code: int, obj: Dict[str, Any]) -> None:
-    raw = json.dumps(obj).encode("utf-8")
-    handler.send_response(code)
-    handler.send_header("Content-Type", "application/json")
-    handler.send_header("Content-Length", str(len(raw)))
-    handler.end_headers()
-    handler.wfile.write(raw)
+def prompt_path(label: str, default: str) -> Path:
+    return Path(prompt_str(label, default))
 
 
-def read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
-    length = int(handler.headers.get("Content-Length", "0"))
-    raw = handler.rfile.read(length) if length else b"{}"
-    return json.loads(raw.decode("utf-8"))
+def prompt_generated_token() -> str:
+    generated = secrets.token_urlsafe(12)
+    try:
+        raw = input(f"Shared token [Enter={generated}; type 'none' for no token]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return generated
+    if not raw:
+        return generated
+    if raw.lower() in {"none", "blank", "no"}:
+        return ""
+    return raw
 
 
-def http_post_json(url: str, payload: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
-    req = urllib_request.Request(
-        url, data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib_request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+# ── network helpers ────────────────────────────────────────────────────
+def get_local_ips() -> List[str]:
+    ips: List[str] = []
+    def add(ip: str) -> None:
+        ip = (ip or "").strip()
+        if ip and not ip.startswith("127.") and ":" not in ip and ip not in ips:
+            ips.append(ip)
+    try:
+        for res in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            add(res[4][0])
+    except Exception:
+        pass
+    for probe in ["8.8.8.8", "1.1.1.1", "192.168.1.1", "10.0.0.1"]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((probe, 80))
+            add(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+    return ips
 
 
-def http_get_json(url: str, timeout: float = 10.0) -> Dict[str, Any]:
-    with urllib_request.urlopen(url, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def port_is_free(host: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+        return True
+    except OSError:
+        return False
+
+
+def find_free_port(host: str = "0.0.0.0", preferred: int = 8765, span: int = 200) -> int:
+    for p in range(preferred, preferred + span):
+        if port_is_free(host, p):
+            return p
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return int(s.getsockname()[1])
+
+
+def http_json(url: str, method: str = "GET", payload: Optional[Dict] = None,
+              token: str = "", timeout: int = 300) -> Dict[str, Any]:
+    import urllib.request
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url=url, data=data, method=method)
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+    if token:
+        req.add_header("X-Token", token)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def normalize_worker_url(text: str, default_port: Optional[int] = None) -> str:
+    text = text.strip().rstrip("/")
+    if not text:
+        return ""
+    if not text.startswith("http://") and not text.startswith("https://"):
+        if default_port and ":" not in text.split("/")[-1]:
+            text = f"http://{text}:{default_port}"
+        else:
+            text = "http://" + text
+    return text.rstrip("/")
+
+
+def scan_subnet_for_workers(base_ip: str, port: int, token: str = "",
+                            timeout: float = 1.0) -> List[Dict[str, Any]]:
+    found: List[Dict[str, Any]] = []
+    try:
+        net = ipaddress.ip_network(base_ip + "/24", strict=False)
+    except Exception:
+        return found
+    candidates = [str(ip) for ip in net.hosts()]
+
+    def check(ip: str) -> Optional[Dict[str, Any]]:
+        url = f"http://{ip}:{port}"
+        try:
+            data = http_json(url + "/health", method="GET", token=token,
+                             timeout=max(1, int(timeout)))
+            if data.get("ok") and data.get("role") == "microgo_worker":
+                data["url"] = url
+                return data
+        except Exception:
+            pass
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=48) as ex:
+        futs = {ex.submit(check, ip): ip for ip in candidates}
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                res = fut.result()
+            except Exception:
+                res = None
+            if res:
+                found.append(res)
+    found.sort(key=lambda x: x.get("url", ""))
+    return found
+
+
+def ping_workers(urls: Sequence[str], token: str) -> List[Dict[str, Any]]:
+    out = []
+    for url in urls:
+        try:
+            data = http_json(url.rstrip("/") + "/health", token=token, timeout=5)
+            out.append({"url": url, **data})
+        except Exception as e:
+            out.append({"url": url, "ok": False, "error": repr(e)})
+    return out
+
+
+def choose_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ── Go rules ───────────────────────────────────────────────────────────
@@ -361,105 +287,85 @@ class GoState:
 
     @staticmethod
     def new() -> "GoState":
-        board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-        st = GoState(board.tobytes(), 1, 0, tuple(), 0)
-        h = st.position_hash()
-        return GoState(board.tobytes(), 1, 0, (h,), 0)
+        b = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
+        st = GoState(b.tobytes(), 1, 0, tuple(), 0)
+        h = st._pos_hash()
+        return GoState(b.tobytes(), 1, 0, (h,), 0)
+
+    def _pos_hash(self) -> str:
+        return hashlib.sha1(self.board + bytes([1 if self.to_play == 1 else 2])).hexdigest()
 
     def board_array(self) -> np.ndarray:
         return np.frombuffer(self.board, dtype=np.int8).copy().reshape(BOARD_SIZE, BOARD_SIZE)
 
-    def position_hash(self) -> str:
-        raw = self.board + bytes([1 if self.to_play == 1 else 2])
-        return hashlib.sha1(raw).hexdigest()
-
-    def neighbors(self, r: int, c: int) -> List[Tuple[int, int]]:
+    def _nbrs(self, r, c):
         out = []
-        if r > 0: out.append((r - 1, c))
-        if r + 1 < BOARD_SIZE: out.append((r + 1, c))
-        if c > 0: out.append((r, c - 1))
-        if c + 1 < BOARD_SIZE: out.append((r, c + 1))
+        if r > 0: out.append((r-1, c))
+        if r+1 < BOARD_SIZE: out.append((r+1, c))
+        if c > 0: out.append((r, c-1))
+        if c+1 < BOARD_SIZE: out.append((r, c+1))
         return out
 
-    def group_and_liberties(self, board: np.ndarray, r: int, c: int):
+    def _group_libs(self, board, r, c):
         color = int(board[r, c])
-        stack = [(r, c)]
-        seen = {(r, c)}
-        group, libs = [], set()
+        stack = [(r, c)]; seen = {(r, c)}; group = []; libs = set()
         while stack:
-            rr, cc = stack.pop()
-            group.append((rr, cc))
-            for nr, nc in self.neighbors(rr, cc):
+            rr, cc = stack.pop(); group.append((rr, cc))
+            for nr, nc in self._nbrs(rr, cc):
                 v = int(board[nr, nc])
-                if v == 0:
-                    libs.add((nr, nc))
+                if v == 0: libs.add((nr, nc))
                 elif v == color and (nr, nc) not in seen:
-                    seen.add((nr, nc))
-                    stack.append((nr, nc))
+                    seen.add((nr, nc)); stack.append((nr, nc))
         return group, libs
 
     def legal_moves(self) -> List[int]:
         moves = []
         board = self.board_array()
         for r, c in np.argwhere(board == 0):
-            mv = int(r) * BOARD_SIZE + int(c)
-            if self.try_play(mv) is not None:
-                moves.append(mv)
+            if self.try_play(int(r)*BOARD_SIZE+int(c)) is not None:
+                moves.append(int(r)*BOARD_SIZE+int(c))
         moves.append(PASS_MOVE)
         return moves
 
     def try_play(self, move: int) -> Optional["GoState"]:
         board = self.board_array()
         if move == PASS_MOVE:
-            ns = GoState(board.tobytes(), -self.to_play, self.passes + 1, self.history, self.move_count + 1)
-            h = ns.position_hash()
-            return GoState(ns.board, ns.to_play, ns.passes, self.history + (h,), self.move_count + 1)
+            ns = GoState(board.tobytes(), -self.to_play, self.passes+1, self.history, self.move_count+1)
+            h = ns._pos_hash()
+            return GoState(ns.board, ns.to_play, ns.passes, self.history+(h,), self.move_count+1)
         r, c = divmod(move, BOARD_SIZE)
-        if board[r, c] != 0:
-            return None
+        if board[r, c] != 0: return None
         board[r, c] = self.to_play
-        opp = -self.to_play
-        for nr, nc in self.neighbors(r, c):
-            if board[nr, nc] == opp:
-                grp, libs = self.group_and_liberties(board, nr, nc)
+        for nr, nc in self._nbrs(r, c):
+            if board[nr, nc] == -self.to_play:
+                grp, libs = self._group_libs(board, nr, nc)
                 if not libs:
-                    for gr, gc in grp:
-                        board[gr, gc] = 0
-        grp, libs = self.group_and_liberties(board, r, c)
-        if not libs:
-            return None
-        ns = GoState(board.tobytes(), opp, 0, self.history, self.move_count + 1)
-        h = ns.position_hash()
-        if h in self.history:
-            return None
-        return GoState(ns.board, ns.to_play, ns.passes, self.history + (h,), self.move_count + 1)
+                    for gr, gc in grp: board[gr, gc] = 0
+        grp, libs = self._group_libs(board, r, c)
+        if not libs: return None
+        ns = GoState(board.tobytes(), -self.to_play, 0, self.history, self.move_count+1)
+        h = ns._pos_hash()
+        if h in self.history: return None
+        return GoState(ns.board, ns.to_play, ns.passes, self.history+(h,), self.move_count+1)
 
     def game_over(self) -> bool:
         return self.passes >= 2 or self.move_count >= MAX_GAME_LEN
 
     def final_score_black(self) -> float:
         board = self.board_array()
-        sb = int(np.sum(board == 1))
-        sw = int(np.sum(board == -1))
-        visited = np.zeros_like(board, dtype=np.uint8)
-        tb = tw = 0
+        sb = int(np.sum(board == 1)); sw = int(np.sum(board == -1))
+        visited = np.zeros_like(board, dtype=np.uint8); tb = tw = 0
         for r in range(BOARD_SIZE):
             for c in range(BOARD_SIZE):
-                if board[r, c] != 0 or visited[r, c]:
-                    continue
-                stack = [(r, c)]
-                region, borders = [], set()
-                visited[r, c] = 1
+                if board[r, c] != 0 or visited[r, c]: continue
+                stack = [(r, c)]; region = []; borders = set(); visited[r, c] = 1
                 while stack:
-                    rr, cc = stack.pop()
-                    region.append((rr, cc))
-                    for nr, nc in self.neighbors(rr, cc):
+                    rr, cc = stack.pop(); region.append((rr, cc))
+                    for nr, nc in self._nbrs(rr, cc):
                         v = int(board[nr, nc])
                         if v == 0 and not visited[nr, nc]:
-                            visited[nr, nc] = 1
-                            stack.append((nr, nc))
-                        elif v != 0:
-                            borders.add(v)
+                            visited[nr, nc] = 1; stack.append((nr, nc))
+                        elif v != 0: borders.add(v)
                 if borders == {1}: tb += len(region)
                 elif borders == {-1}: tw += len(region)
         return (sb + tb) - (sw + tw + KOMI)
@@ -468,11 +374,10 @@ class GoState:
         return 1 if self.final_score_black() > 0 else -1
 
 
-def move_to_str(move: int) -> str:
-    if move == PASS_MOVE:
-        return "pass"
-    r, c = divmod(move, BOARD_SIZE)
-    return f"{chr(ord('A') + c)}{r + 1}"
+def move_to_str(m: int) -> str:
+    if m == PASS_MOVE: return "pass"
+    r, c = divmod(m, BOARD_SIZE)
+    return f"{chr(ord('A')+c)}{r+1}"
 
 
 def encode_state(state: GoState) -> np.ndarray:
@@ -483,36 +388,30 @@ def encode_state(state: GoState) -> np.ndarray:
     legal = np.zeros_like(own)
     for mv in state.legal_moves():
         if mv != PASS_MOVE:
-            r, c = divmod(mv, BOARD_SIZE)
-            legal[r, c] = 1.0
+            r, c = divmod(mv, BOARD_SIZE); legal[r, c] = 1.0
     age = np.full_like(own, min(state.move_count / MAX_GAME_LEN, 1.0))
     return np.stack([own, opp, turn, legal, age], axis=0)
 
 
-# ── Graph-team neural net ─────────────────────────────────────────────
-class ResidualBlock(nn.Module):
-    def __init__(self, ch: int):
+# ── Neural net ─────────────────────────────────────────────────────────
+class ResBlock(nn.Module):
+    def __init__(self, ch):
         super().__init__()
-        self.c1 = nn.Conv2d(ch, ch, 3, padding=1)
-        self.b1 = nn.BatchNorm2d(ch)
-        self.c2 = nn.Conv2d(ch, ch, 3, padding=1)
-        self.b2 = nn.BatchNorm2d(ch)
-
+        self.c1 = nn.Conv2d(ch, ch, 3, padding=1); self.b1 = nn.BatchNorm2d(ch)
+        self.c2 = nn.Conv2d(ch, ch, 3, padding=1); self.b2 = nn.BatchNorm2d(ch)
     def forward(self, x):
         return F.relu(x + self.b2(self.c2(F.relu(self.b1(self.c1(x))))))
 
 
 class ExpertTower(nn.Module):
-    def __init__(self, ch: int, dd: int, blocks: int = 1):
+    def __init__(self, ch, dd, blocks=1):
         super().__init__()
-        self.blocks = nn.Sequential(*[ResidualBlock(ch) for _ in range(blocks)])
+        self.blocks = nn.Sequential(*[ResBlock(ch) for _ in range(blocks)])
         self.ph = nn.Sequential(nn.Conv2d(ch, 2, 1), nn.BatchNorm2d(2), nn.ReLU())
-        self.pf = nn.Linear(2 * BOARD_SIZE * BOARD_SIZE, ALL_MOVES)
+        self.pf = nn.Linear(2*BOARD_SIZE*BOARD_SIZE, ALL_MOVES)
         self.vh = nn.Sequential(nn.Conv2d(ch, 1, 1), nn.BatchNorm2d(1), nn.ReLU())
-        self.vf1 = nn.Linear(BOARD_SIZE * BOARD_SIZE, 48)
-        self.vf2 = nn.Linear(48, 1)
+        self.vf1 = nn.Linear(BOARD_SIZE*BOARD_SIZE, 48); self.vf2 = nn.Linear(48, 1)
         self.df = nn.Linear(ch, dd)
-
     def forward(self, base):
         h = self.blocks(base)
         logits = self.pf(self.ph(h).flatten(1))
@@ -522,16 +421,15 @@ class ExpertTower(nn.Module):
 
 
 class GraphTeamNet(nn.Module):
-    def __init__(self, ch=24, sb=1, eb=1, dd=32, expert_names=None):
+    def __init__(self, ch=24, sb=1, eb=1, dd=32):
         super().__init__()
-        self.expert_names = expert_names or list(EXPERT_NAMES)
-        self.ne = len(self.expert_names)
+        self.expert_names = list(EXPERT_NAMES); ne = len(EXPERT_NAMES)
         self.stem = nn.Sequential(nn.Conv2d(5, ch, 3, padding=1), nn.BatchNorm2d(ch), nn.ReLU())
-        self.shared = nn.Sequential(*[ResidualBlock(ch) for _ in range(sb)])
-        self.experts = nn.ModuleList([ExpertTower(ch, dd, eb) for _ in range(self.ne)])
-        self.expert_token = nn.Parameter(torch.randn(self.ne, dd) * 0.05)
-        self.router = nn.Sequential(nn.Linear(ch + 3, 64), nn.ReLU(), nn.Linear(64, self.ne))
-        self.edge_logits = nn.Parameter(torch.zeros(self.ne, self.ne))
+        self.shared = nn.Sequential(*[ResBlock(ch) for _ in range(sb)])
+        self.experts = nn.ModuleList([ExpertTower(ch, dd, eb) for _ in range(ne)])
+        self.expert_token = nn.Parameter(torch.randn(ne, dd)*0.05)
+        self.router = nn.Sequential(nn.Linear(ch+3, 64), nn.ReLU(), nn.Linear(64, ne))
+        self.edge_logits = nn.Parameter(torch.zeros(ne, ne))
         self.conf_head = nn.Linear(dd, 1)
         self.router_temp = nn.Parameter(torch.tensor(1.0))
 
@@ -539,6 +437,7 @@ class GraphTeamNet(nn.Module):
         return torch.softmax(self.edge_logits, dim=-1)
 
     def forward(self, x, return_aux=False):
+        ne = len(self.expert_names)
         base = self.shared(self.stem(x))
         pooled = F.adaptive_avg_pool2d(base, 1).flatten(1)
         phase = x[:, 4].mean(dim=(1, 2)).unsqueeze(-1)
@@ -556,117 +455,97 @@ class GraphTeamNet(nn.Module):
         conf = self.conf_head(torch.tanh(ds + md)).squeeze(-1)
         temp = torch.clamp(self.router_temp.abs(), 0.3, 3.0)
         w = torch.softmax((rl + conf) / temp, dim=-1)
-        fp = (ps * w.unsqueeze(-1)).sum(1)
-        fv = (vs * w).sum(1)
-        if not return_aux:
-            return fp, fv
-        aux = {"weights": w, "router_logits": rl,
-               "router_probs": torch.softmax(rl, -1),
-               "conf": conf, "edges": edges.unsqueeze(0).expand(x.shape[0], -1, -1),
-               "expert_values": vs}
-        return fp, fv, aux
+        fp = (ps * w.unsqueeze(-1)).sum(1); fv = (vs * w).sum(1)
+        if not return_aux: return fp, fv
+        return fp, fv, {"weights": w, "router_probs": torch.softmax(rl, -1),
+                        "conf": conf, "expert_values": vs}
 
     def snapshot_graph(self):
         with torch.no_grad():
             return {"experts": list(self.expert_names),
                     "edges": self.graph_matrix().cpu().numpy().tolist(),
-                    "router_temperature": float(torch.clamp(self.router_temp.abs(), 0.3, 3.0).cpu())}
+                    "temp": float(torch.clamp(self.router_temp.abs(), 0.3, 3.0).cpu())}
 
 
 def new_team(device):
     net = GraphTeamNet(); net.to(device); net.eval(); return net
 
-
-def net_bytes(net):
+def net_to_b64(net):
     bio = io.BytesIO(); torch.save(net.state_dict(), bio)
     return base64.b64encode(gzip.compress(bio.getvalue())).decode("ascii")
 
-
-def load_net_from_bytes(payload, device):
+def net_from_b64(payload, device):
     net = new_team(device)
     raw = gzip.decompress(base64.b64decode(payload.encode("ascii")))
     net.load_state_dict(torch.load(io.BytesIO(raw), map_location=device, weights_only=False))
     net.eval(); return net
 
-
-def infer_with_aux(net, device, state):
+def infer_aux(net, device, state):
     x = torch.from_numpy(encode_state(state)).unsqueeze(0).to(device)
     with torch.no_grad():
         lo, va, aux = net(x, return_aux=True)
     return (lo.squeeze(0).cpu().numpy(), float(va.squeeze(0).cpu()),
             {"weights": aux["weights"].squeeze(0).cpu().numpy().tolist(),
-             "router_probs": aux["router_probs"].squeeze(0).cpu().numpy().tolist(),
              "conf": aux["conf"].squeeze(0).cpu().numpy().tolist()})
 
 
 # ── MCTS ───────────────────────────────────────────────────────────────
 @dataclass
 class TreeNode:
-    prior: float
-    to_play: int
-    visit_count: int = 0
-    value_sum: float = 0.0
-    children: Dict[int, "TreeNode"] = field(default_factory=dict)
-    expanded: bool = False
+    prior: float; to_play: int; visit_count: int = 0; value_sum: float = 0.0
+    children: Dict[int, "TreeNode"] = field(default_factory=dict); expanded: bool = False
     def value(self):
         return 0.0 if self.visit_count == 0 else self.value_sum / self.visit_count
 
-
 class MCTS:
-    def __init__(self, net, device, num_simulations=32, c_puct=1.5):
-        self.net = net; self.device = device
-        self.num_simulations = num_simulations; self.c_puct = c_puct
+    def __init__(self, net, device, sims=32, c_puct=1.5):
+        self.net = net; self.device = device; self.sims = sims; self.c = c_puct
 
-    def evaluate_state(self, state):
+    def _eval(self, state):
         x = torch.from_numpy(encode_state(state)).unsqueeze(0).to(self.device)
         with torch.no_grad():
             lo, va = self.net(x)
             lo = lo.squeeze(0).cpu().numpy(); val = float(va.squeeze(0).cpu())
         legal = state.legal_moves()
         mask = np.zeros(ALL_MOVES, dtype=np.float32); mask[legal] = 1.0
-        lo[mask == 0] = -1e9
-        pr = np.exp(lo - lo.max()); pr *= mask
-        s = pr.sum()
-        pr = mask / max(mask.sum(), 1.0) if s <= 0 else pr / s
+        lo[mask == 0] = -1e9; pr = np.exp(lo - lo.max()); pr *= mask
+        s = pr.sum(); pr = mask / max(mask.sum(), 1.0) if s <= 0 else pr / s
         return pr, val
 
-    def expand(self, node, state, root_noise=False):
-        priors, value = self.evaluate_state(state)
-        legal = state.legal_moves()
-        if root_noise and legal:
-            noise = np.random.dirichlet([0.3] * len(legal))
-            for i, mv in enumerate(legal):
-                priors[mv] = 0.75 * priors[mv] + 0.25 * noise[i]
+    def _expand(self, node, state, noise=False):
+        priors, value = self._eval(state); legal = state.legal_moves()
+        if noise and legal:
+            n = np.random.dirichlet([0.3]*len(legal))
+            for i, mv in enumerate(legal): priors[mv] = 0.75*priors[mv] + 0.25*n[i]
         for mv in legal:
             cs = state.try_play(mv)
-            if cs is not None:
-                node.children[mv] = TreeNode(prior=float(priors[mv]), to_play=cs.to_play)
+            if cs: node.children[mv] = TreeNode(float(priors[mv]), cs.to_play)
         node.expanded = True; return value
 
-    def select_child(self, node):
+    def _select(self, node):
         tv = math.sqrt(max(1, node.visit_count)); best_s = -1e9; best_m = PASS_MOVE; best_c = None
         for mv, ch in node.children.items():
-            sc = -ch.value() + self.c_puct * ch.prior * tv / (1 + ch.visit_count)
+            sc = -ch.value() + self.c * ch.prior * tv / (1+ch.visit_count)
             if sc > best_s: best_s = sc; best_m = mv; best_c = ch
         return best_m, best_c
 
     def run(self, root_state):
-        root = TreeNode(prior=1.0, to_play=root_state.to_play)
+        root = TreeNode(1.0, root_state.to_play)
         if root_state.game_over():
             v = np.zeros(ALL_MOVES, dtype=np.float32); v[PASS_MOVE] = 1.0; return v
-        self.expand(root, root_state, root_noise=True)
-        for _ in range(self.num_simulations):
+        self._expand(root, root_state, noise=True)
+        for _ in range(self.sims):
             node = root; state = root_state; path = [node]
             while node.expanded and node.children:
-                mv, child = self.select_child(node)
+                mv, child = self._select(node)
                 ns = state.try_play(mv)
-                if ns is None: break
+                if not ns: break
                 node = child; state = ns; path.append(node)
                 if state.game_over(): break
             if state.game_over():
                 value = 1.0 if state.winner() == state.to_play else -1.0
             else:
-                value = self.expand(node, state)
+                value = self._expand(node, state)
             for bn in reversed(path):
                 bn.visit_count += 1; bn.value_sum += value; value = -value
         visits = np.zeros(ALL_MOVES, dtype=np.float32)
@@ -674,62 +553,90 @@ class MCTS:
         return visits
 
 
-def sample_move_from_visits(visits, state, temperature):
-    legal = state.legal_moves()
-    pr = np.zeros_like(visits); pr[legal] = visits[legal]
+def sample_move(visits, state, temp):
+    legal = state.legal_moves(); pr = np.zeros_like(visits); pr[legal] = visits[legal]
     if pr.sum() <= 0: pr[legal] = 1.0
-    if temperature <= 1e-4:
+    if temp <= 1e-4:
         mv = int(np.argmax(pr)); oh = np.zeros_like(pr); oh[mv] = 1.0; return mv, oh
-    pp = pr ** (1.0 / temperature); s = pp.sum()
+    pp = pr ** (1.0/temp); s = pp.sum()
     if s <= 0: pp[legal] = 1.0; s = pp.sum()
-    pp /= s; mv = int(np.random.choice(np.arange(ALL_MOVES), p=pp)); return mv, pp
+    pp /= s; return int(np.random.choice(np.arange(ALL_MOVES), p=pp)), pp
 
 
-# ── Replay and training ───────────────────────────────────────────────
+# ── Self-play ──────────────────────────────────────────────────────────
 @dataclass
 class Sample:
-    state_planes: np.ndarray
-    policy: np.ndarray
-    z: float
-
+    state_planes: np.ndarray; policy: np.ndarray; z: float
 
 class ReplayBuffer:
-    def __init__(self, capacity=50000):
-        self.capacity = capacity; self.samples: List[Sample] = []; self.lock = threading.Lock()
-
-    def add_many(self, batch):
+    def __init__(self, cap=50000):
+        self.cap = cap; self.data: List[Sample] = []; self.lock = threading.Lock()
+    def add(self, batch):
         with self.lock:
-            self.samples.extend(batch)
-            if len(self.samples) > self.capacity:
-                self.samples = self.samples[-self.capacity:]
-
+            self.data.extend(batch)
+            if len(self.data) > self.cap: self.data = self.data[-self.cap:]
     def size(self):
-        with self.lock: return len(self.samples)
-
+        with self.lock: return len(self.data)
     def sample_batch(self, bs):
         with self.lock:
-            if len(self.samples) < bs: return None
-            idx = np.random.choice(len(self.samples), bs, replace=False)
-            ch = [self.samples[i] for i in idx]
+            if len(self.data) < bs: return None
+            idx = np.random.choice(len(self.data), bs, replace=False)
+            ch = [self.data[i] for i in idx]
         return (np.stack([s.state_planes for s in ch]),
                 np.stack([s.policy for s in ch]),
                 np.array([s.z for s in ch], dtype=np.float32))
 
 
-def train_team(net, replay, device, steps=100, batch_size=64, lr=1e-3, wd=1e-4):
-    if replay.size() < batch_size:
-        return {"steps": 0, "policy_loss": None, "value_loss": None, "total_loss": None}
+def self_play_game(net, device, sims, temp_moves=10):
+    state = GoState.new(); samples = []; moves = []; gate_trace = []
+    mcts = MCTS(net, device, sims)
+    while not state.game_over():
+        _, _, aux = infer_aux(net, device, state)
+        gate_trace.append(aux["weights"])
+        visits = mcts.run(state)
+        temp = 1.0 if state.move_count < temp_moves else 1e-6
+        mv, policy = sample_move(visits, state, temp)
+        samples.append((encode_state(state), policy.astype(np.float32), state.to_play))
+        moves.append(move_to_str(mv))
+        ns = state.try_play(mv)
+        if not ns: ns = state.try_play(PASS_MOVE)
+        if not ns: break
+        state = ns
+    winner = state.winner()
+    return {"winner": winner, "score_black": state.final_score_black(),
+            "num_moves": len(moves), "moves": moves,
+            "samples": [Sample(s, p, 1.0 if pl == winner else -1.0) for s, p, pl in samples],
+            "avg_gate": np.mean(gate_trace, axis=0).tolist() if gate_trace else [0.0]*len(EXPERT_NAMES)}
+
+
+def do_selfplay_job(model_b64: str, device: str, sims: int, games: int) -> Dict[str, Any]:
+    """Run N self-play games. This is what workers execute."""
+    net = net_from_b64(model_b64, device)
+    results = []; packed = []; gate_means = []
+    for gi in range(games):
+        res = self_play_game(net, device, sims)
+        results.append({k: v for k, v in res.items() if k != "samples"})
+        gate_means.append(res.get("avg_gate", [0.0]*len(EXPERT_NAMES)))
+        for s in res["samples"]:
+            packed.append([s.state_planes.tolist(), s.policy.tolist(), float(s.z)])
+    return {"results": results, "samples": compress_obj(packed),
+            "avg_gate": np.mean(gate_means, axis=0).tolist() if gate_means else [0.0]*len(EXPERT_NAMES)}
+
+
+# ── Training ───────────────────────────────────────────────────────────
+def train_team(net, replay, device, steps=100, bs=64, lr=1e-3):
+    if replay.size() < bs:
+        return {"steps": 0, "total_loss": None}
     net.train()
-    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=wd)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
     pl, vl, tl = [], [], []
     for _ in range(steps):
-        b = replay.sample_batch(batch_size)
-        if b is None: break
+        b = replay.sample_batch(bs)
+        if not b: break
         x, p_tgt, z = [torch.from_numpy(a).to(device) for a in b]
         logits, value = net(x)
         ploss = -(p_tgt * F.log_softmax(logits, -1)).sum(-1).mean()
-        vloss = F.mse_loss(value, z)
-        loss = ploss + vloss
+        vloss = F.mse_loss(value, z); loss = ploss + vloss
         opt.zero_grad(set_to_none=True); loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0); opt.step()
         pl.append(float(ploss.cpu())); vl.append(float(vloss.cpu())); tl.append(float(loss.cpu()))
@@ -741,645 +648,503 @@ def train_team(net, replay, device, steps=100, batch_size=64, lr=1e-3, wd=1e-4):
             "graph": net.snapshot_graph()}
 
 
-# ── Self-play and evaluation ──────────────────────────────────────────
-def self_play_game(net, device, sims, temp_moves=10, c_puct=1.5):
-    state = GoState.new(); samples = []; moves_sgf = []; gate_trace = []
-    mcts = MCTS(net, device, sims, c_puct)
-    while not state.game_over():
-        _, _, aux = infer_with_aux(net, device, state)
-        gate_trace.append(aux["weights"])
-        visits = mcts.run(state)
-        temp = 1.0 if state.move_count < temp_moves else 1e-6
-        move, policy = sample_move_from_visits(visits, state, temp)
-        samples.append((encode_state(state), policy.astype(np.float32), state.to_play))
-        moves_sgf.append(move_to_str(move))
-        ns = state.try_play(move)
-        if ns is None:
-            ns = state.try_play(PASS_MOVE)
-            if ns is None: break
-        state = ns
-    winner = state.winner()
-    return {"winner": winner, "score_black": state.final_score_black(),
-            "num_moves": len(moves_sgf),
-            "samples": [Sample(s, p, 1.0 if pl == winner else -1.0) for s, p, pl in samples],
-            "moves": moves_sgf,
-            "avg_gate": np.mean(gate_trace, axis=0).tolist() if gate_trace else [0.0] * len(EXPERT_NAMES)}
-
-
-def choose_move_for_eval(net, device, state, sims, return_aux=False):
-    aux_py = None
-    if return_aux: _, _, aux_py = infer_with_aux(net, device, state)
+# ── Evaluation ─────────────────────────────────────────────────────────
+def eval_move(net, device, state, sims):
     mcts = MCTS(net, device, sims, 1.3); visits = mcts.run(state)
     legal = state.legal_moves(); masked = np.zeros_like(visits); masked[legal] = visits[legal]
-    mv = PASS_MOVE if masked.sum() <= 0 else int(np.argmax(masked))
-    return (mv, aux_py) if return_aux else mv
+    return PASS_MOVE if masked.sum() <= 0 else int(np.argmax(masked))
 
-
-def play_match(nb, nw, db, dw, sims, collect_diag=False):
-    state = GoState.new(); moves = []; ddb = []; ddw = []
+def play_match(nb, nw, db, dw, sims):
+    state = GoState.new()
     while not state.game_over():
-        if state.to_play == 1:
-            mv, aux = choose_move_for_eval(nb, db, state, sims, collect_diag)
-            if collect_diag and aux: ddb.append(aux["weights"])
-        else:
-            mv, aux = choose_move_for_eval(nw, dw, state, sims, collect_diag)
-            if collect_diag and aux: ddw.append(aux["weights"])
-        moves.append(move_to_str(mv))
+        mv = eval_move(nb if state.to_play == 1 else nw,
+                       db if state.to_play == 1 else dw, state, sims)
         ns = state.try_play(mv)
-        if ns is None:
-            ns = state.try_play(PASS_MOVE)
-            if ns is None: break
+        if not ns: ns = state.try_play(PASS_MOVE)
+        if not ns: break
         state = ns
-    return {"winner": state.winner(), "score_black": state.final_score_black(),
-            "moves": moves, "num_moves": len(moves),
-            "diag_black": np.mean(ddb, axis=0).tolist() if ddb else [0.0] * len(EXPERT_NAMES),
-            "diag_white": np.mean(ddw, axis=0).tolist() if ddw else [0.0] * len(EXPERT_NAMES)}
-
+    return {"winner": state.winner(), "score_black": state.final_score_black()}
 
 def play_vs_random(net, device, sims, games=8, as_black=True):
-    wins = 0; diag = []
+    wins = 0
     for _ in range(games):
         state = GoState.new()
         while not state.game_over():
             our = (state.to_play == 1 and as_black) or (state.to_play == -1 and not as_black)
-            if our:
-                mv, aux = choose_move_for_eval(net, device, state, sims, True)
-                if aux: diag.append(aux["weights"])
-            else:
-                mv = random.choice(state.legal_moves())
+            mv = eval_move(net, device, state, sims) if our else random.choice(state.legal_moves())
             ns = state.try_play(mv)
-            if ns is None:
-                ns = state.try_play(PASS_MOVE)
-                if ns is None: break
+            if not ns: ns = state.try_play(PASS_MOVE)
+            if not ns: break
             state = ns
         w = state.winner()
         if (w == 1 and as_black) or (w == -1 and not as_black): wins += 1
-    return {"win_rate": wins / max(1, games),
-            "avg_gate": np.mean(diag, axis=0).tolist() if diag else [0.0] * len(EXPERT_NAMES)}
+    return wins / max(1, games)
+
+def evaluate_pair(nets, device, sims, games):
+    wins_a = 0; half = max(1, games//2)
+    for _ in range(half):
+        r = play_match(nets["A"], nets["B"], device, device, sims)
+        if r["winner"] == 1: wins_a += 1
+    for _ in range(games - half):
+        r = play_match(nets["B"], nets["A"], device, device, sims)
+        if r["winner"] == -1: wins_a += 1
+    avr = play_vs_random(nets["A"], device, sims, max(4, games//2))
+    bvr = play_vs_random(nets["B"], device, sims, max(4, games//2))
+    return {"games": games, "wins_A": wins_a, "wins_B": games-wins_a,
+            "A_vs_random": round(avr, 3), "B_vs_random": round(bvr, 3)}
 
 
-# ── Leaderboard ───────────────────────────────────────────────────────
 class Leaderboard:
     def __init__(self):
         self.ratings: Dict[str, float] = {}
-
-    def ensure(self, name, rating=1000.0):
-        self.ratings.setdefault(name, rating)
-
-    def update(self, a, b, score_a, k=24.0):
+    def ensure(self, name, r=1000.0):
+        self.ratings.setdefault(name, r)
+    def update(self, a, b, sa, k=24.0):
         self.ensure(a); self.ensure(b)
-        ea = 1.0 / (1.0 + 10 ** ((self.ratings[b] - self.ratings[a]) / 400.0))
-        self.ratings[a] += k * (score_a - ea)
-        self.ratings[b] += k * ((1.0 - score_a) - (1.0 - ea))
-
+        ea = 1.0/(1.0+10**((self.ratings[b]-self.ratings[a])/400.0))
+        self.ratings[a] += k*(sa-ea); self.ratings[b] += k*((1-sa)-(1-ea))
     def top(self):
         return sorted(self.ratings.items(), key=lambda x: x[1], reverse=True)
 
 
-# ── Coordinator state and server ──────────────────────────────────────
-@dataclass
-class Job:
-    job_id: str
-    kind: str
-    net_name: str
-    sims: int
-    payload: Dict[str, Any]
+# ── Worker HTTP server (same pattern as MiniLab) ──────────────────────
+WORKER_CTX = {
+    "name": socket.gethostname(),
+    "token": "",
+    "device": "cpu",
+    "version": "exosfear-microgo-kg-1",
+}
 
 
-class CoordinatorState:
-    def __init__(self, run_dir, token, device, coord_port=None, open_pairing=True):
-        self.run_dir = run_dir; self.token = token; self.device = device
-        self.coord_port = coord_port; self.open_pairing = open_pairing
-        self.lock = threading.Lock()
-        self.jobs: queue.Queue[Job] = queue.Queue()
-        self.completed: List[Dict[str, Any]] = []
-        self.workers: Dict[str, Dict[str, Any]] = {}
-        self.stop = False
-        self.nets = {"A": new_team(device), "B": new_team(device)}
-        self.replays = {"A": ReplayBuffer(), "B": ReplayBuffer()}
-        self.leaderboard = Leaderboard()
-        self.leaderboard.ensure("A_current"); self.leaderboard.ensure("B_current")
-        self.round_stats: List[Dict[str, Any]] = []
+class WorkerHandler(BaseHTTPRequestHandler):
+    server_version = "ExosfearMicroGoWorker/1.0"
 
-    def add_worker_ping(self, wid, info):
-        with self.lock: info["last_seen"] = now_ts(); self.workers[wid] = info
-
-    def next_job(self):
-        try: return self.jobs.get_nowait()
-        except queue.Empty: return None
-
-    def submit_result(self, result):
-        with self.lock: self.completed.append(result)
-
-
-class CoordinatorHandler(BaseHTTPRequestHandler):
-    state: CoordinatorState = None  # type: ignore
-    def log_message(self, *a): pass
+    def _check_token(self) -> bool:
+        expected = WORKER_CTX.get("token", "")
+        if not expected: return True
+        return self.headers.get("X-Token", "") == expected
 
     def do_GET(self):
         if self.path.startswith("/health"):
-            maybe_json_response(self, 200, {"ok": True, "ts": now_ts(),
-                "workers": len(self.state.workers), "role": "coordinator",
-                "open_pairing": self.state.open_pairing})
+            if not self._check_token():
+                self._resp(403, {"ok": False, "error": "bad token"}); return
+            self._resp(200, {"ok": True, "role": "microgo_worker",
+                             "worker_name": WORKER_CTX["name"],
+                             "device": WORKER_CTX["device"],
+                             "version": WORKER_CTX["version"],
+                             "pid": os.getpid()})
             return
-        if self.path.startswith("/pair/bootstrap"):
-            if not self.state.open_pairing:
-                maybe_json_response(self, 403, {"error": "pairing_closed"}); return
-            maybe_json_response(self, 200, {"ok": True, "token": self.state.token,
-                "coord_port": self.state.coord_port, "open_pairing": True, "ts": now_ts()})
-            return
-        maybe_json_response(self, 404, {"error": "not_found"})
+        self._resp(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
+        if not self._check_token():
+            self._resp(403, {"ok": False, "error": "bad token"}); return
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length) if length > 0 else b"{}"
         try:
-            data = read_json_body(self)
-            if self.path == "/worker/pull_job":
-                if data.get("token") != self.state.token:
-                    maybe_json_response(self, 403, {"error": "bad_token"}); return
-                wid = data.get("worker_id", "?")
-                self.state.add_worker_ping(wid, {"worker_id": wid,
-                    "host": data.get("host"), "port": data.get("port"), "device": data.get("device")})
-                job = self.state.next_job()
-                if job is None:
-                    maybe_json_response(self, 200, {"job": None}); return
-                maybe_json_response(self, 200, {"job": {
-                    "job_id": job.job_id, "kind": job.kind, "net_name": job.net_name,
-                    "sims": job.sims, "payload": job.payload,
-                    "model": net_bytes(self.state.nets[job.net_name])}})
+            payload = json.loads(raw.decode())
+        except Exception:
+            self._resp(400, {"ok": False, "error": "invalid json"}); return
+
+        started = time.time()
+        try:
+            if self.path == "/selfplay":
+                result = do_selfplay_job(
+                    model_b64=payload["model"],
+                    device=WORKER_CTX["device"],
+                    sims=int(payload.get("sims", 20)),
+                    games=int(payload.get("games", 2)),
+                )
+                self._resp(200, {"ok": True, **result,
+                                 "worker_name": WORKER_CTX["name"],
+                                 "seconds": round(time.time()-started, 2)})
                 return
-            elif self.path == "/worker/submit_result":
-                if data.get("token") != self.state.token:
-                    maybe_json_response(self, 403, {"error": "bad_token"}); return
-                self.state.submit_result(data)
-                maybe_json_response(self, 200, {"ok": True}); return
-            elif self.path == "/register":
-                if data.get("token") != self.state.token:
-                    maybe_json_response(self, 403, {"error": "bad_token"}); return
-                wid = data.get("worker_id", "?")
-                self.state.add_worker_ping(wid, data)
-                maybe_json_response(self, 200, {"ok": True}); return
-        except Exception as exc:
-            maybe_json_response(self, 500, {"error": str(exc)}); return
-        maybe_json_response(self, 404, {"error": "not_found"})
+            self._resp(404, {"ok": False, "error": "not found"})
+        except Exception as e:
+            self._resp(500, {"ok": False, "error": repr(e)})
 
+    def _resp(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-def start_coordinator_server(state, host, port):
-    CoordinatorHandler.state = state
-    srv = ReusableThreadingHTTPServer((host, port), CoordinatorHandler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start(); return srv
-
-
-class SimpleWorkerHandler(BaseHTTPRequestHandler):
-    token = ""; info: Dict[str, Any] = {}
     def log_message(self, *a): pass
-    def do_GET(self):
-        if self.path.startswith("/health"):
-            maybe_json_response(self, 200, {"ok": True, **self.info}); return
-        maybe_json_response(self, 404, {"error": "not_found"})
 
 
-def start_worker_health_server(host, port, token, info):
-    SimpleWorkerHandler.token = token; SimpleWorkerHandler.info = info
-    srv = ReusableThreadingHTTPServer((host, port), SimpleWorkerHandler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start(); return srv
+def start_worker_server(host: str, port: int, token: str, device: str) -> ThreadingHTTPServer:
+    WORKER_CTX["token"] = token or ""
+    WORKER_CTX["name"] = socket.gethostname()
+    WORKER_CTX["device"] = device
+    httpd = ThreadingHTTPServer((host, port), WorkerHandler)
+    httpd.daemon_threads = True
+    return httpd
 
 
-def worker_loop(coordinator_url, token, host, port, device, max_idle=999999):
-    wid = f"{socket.gethostname()}-{sha256_text(host + str(port) + device)}"
-    try:
-        http_post_json(coordinator_url + "/register",
-            {"token": token, "worker_id": wid, "host": host, "port": port,
-             "device": device, "ts": now_ts()}, timeout=10.0)
-        print(f"  Registered with coordinator.")
-    except Exception as exc:
-        print(f"  Register warning: {exc}")
-    idle = 0
-    jobs_done = 0
-    while idle < max_idle:
-        try:
-            resp = http_post_json(coordinator_url + "/worker/pull_job",
-                {"token": token, "worker_id": wid, "host": host, "port": port, "device": device}, timeout=30.0)
-        except Exception as exc:
-            print(f"  Pull failed: {exc}"); time.sleep(2); idle += 1; continue
-        job = resp.get("job")
-        if job is None:
-            if idle % 10 == 0 and idle > 0:
-                print(f"  Waiting for jobs... (idle {idle}s, completed {jobs_done} jobs so far)")
-            time.sleep(1); idle += 1; continue
-        idle = 0; started = time.time()
-        print(f"  Got job: {job['job_id']} ({job['kind']})")
-        net = load_net_from_bytes(job["model"], device)
-        if job["kind"] == "selfplay":
-            games = int(job["payload"].get("games", 1))
-            results = []; packed = []; gate_means = []
-            for gi in range(games):
-                print(f"    Playing game {gi+1}/{games}...", end="\r", flush=True)
-                res = self_play_game(net, device, int(job["sims"]))
-                results.append({k: v for k, v in res.items() if k != "samples"})
-                gate_means.append(res.get("avg_gate", [0.0] * len(EXPERT_NAMES)))
-                for s in res["samples"]:
-                    packed.append([s.state_planes.tolist(), s.policy.tolist(), float(s.z)])
-            elapsed = time.time() - started
-            out = {"token": token, "worker_id": wid, "job_id": job["job_id"],
-                   "kind": "selfplay_result", "net_name": job["net_name"],
-                   "results": results, "samples": compress_obj(packed),
-                   "elapsed_sec": elapsed,
-                   "avg_gate": np.mean(gate_means, axis=0).tolist() if gate_means else [0.0] * len(EXPERT_NAMES)}
-            jobs_done += 1
-            print(f"  Job {job['job_id']} done: {games} games in {elapsed:.1f}s  (total jobs: {jobs_done})")
+# ── Coordinator: pushes jobs to workers via HTTP POST ─────────────────
+def push_selfplay_to_worker(url: str, token: str, model_b64: str,
+                            sims: int, games: int, timeout: int = 600) -> Dict[str, Any]:
+    """POST a selfplay job to a worker and get results back."""
+    return http_json(url.rstrip("/") + "/selfplay", method="POST",
+                     payload={"model": model_b64, "sims": sims, "games": games},
+                     token=token, timeout=timeout)
+
+
+def push_selfplay_distributed(
+    model_b64: str, sims: int, total_games: int,
+    worker_urls: List[str], token: str,
+    include_local: bool, device: str,
+) -> List[Dict[str, Any]]:
+    """Distribute self-play games across workers + optionally local."""
+    workers = (["__local__"] if include_local else []) + list(worker_urls)
+    if not workers:
+        workers = ["__local__"]
+
+    # Divide games across workers
+    games_per = max(1, total_games // len(workers))
+    remainder = total_games - games_per * len(workers)
+    assignments: List[Tuple[str, int]] = []
+    for i, w in enumerate(workers):
+        g = games_per + (1 if i < remainder else 0)
+        if g > 0:
+            assignments.append((w, g))
+
+    results: List[Dict[str, Any]] = []
+
+    for worker, num_games in assignments:
+        started = time.time()
+        if worker == "__local__":
+            res = do_selfplay_job(model_b64, device, sims, num_games)
+            res["worker_name"] = "local"
+            res["seconds"] = round(time.time() - started, 2)
+            results.append(res)
         else:
-            out = {"token": token, "worker_id": wid, "job_id": job["job_id"],
-                   "kind": "unknown", "net_name": job["net_name"], "elapsed_sec": time.time() - started}
-        try:
-            http_post_json(coordinator_url + "/worker/submit_result", out, timeout=120.0)
-        except Exception as exc:
-            print(f"  Submit failed: {exc}"); time.sleep(2)
+            try:
+                res = push_selfplay_to_worker(worker, token, model_b64, sims, num_games, timeout=1200)
+                results.append(res)
+            except Exception as exc:
+                print(f"  Worker {worker} failed: {exc}")
+                print(f"  Running those {num_games} games locally instead...")
+                res = do_selfplay_job(model_b64, device, sims, num_games)
+                res["worker_name"] = f"local_fallback_for_{worker}"
+                res["seconds"] = round(time.time() - started, 2)
+                results.append(res)
+
+    return results
 
 
-def wait_for_results(state, expected, poll=1.0):
-    t0 = time.time()
-    last_print = 0
-    while True:
-        with state.lock:
-            got = len(state.completed)
-            if got >= expected:
-                out = list(state.completed); state.completed.clear(); return out
-        now = time.time()
-        if now - last_print > 5:
-            print(f"  Waiting for results: {got}/{expected} (workers: {len(state.workers)}, {now-t0:.0f}s)")
-            last_print = now
-        time.sleep(poll)
+# ── Full pipeline ──────────────────────────────────────────────────────
+def run_pipeline(cfg: Dict[str, Any]) -> None:
+    random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+    run_dir = Path(cfg["run_dir"]); ensure_dir(run_dir); ensure_dir(run_dir / "reports")
+    json_dump(cfg, run_dir / "config.json")
+    device = cfg["device"]
+    token = cfg.get("token", "")
+    worker_urls = cfg.get("worker_urls", [])
+    include_local = cfg.get("include_local", True)
 
+    # Check workers
+    if worker_urls:
+        short_line("Worker status")
+        statuses = ping_workers(worker_urls, token)
+        for s in statuses:
+            tag = "✓" if s.get("ok") else "✗"
+            print(f"  {tag} {s['url']}  {s.get('worker_name', '')}  {s.get('device', '')}")
 
-def save_checkpoint(run_dir, name, net, ridx):
-    tag = f"{name}_r{ridx:03d}"
-    ckpt = run_dir / "checkpoints" / f"{tag}.pt"
-    ckpt.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(net.state_dict(), ckpt)
-    safe_json_dump(run_dir / "graphs" / f"{tag}.json", net.snapshot_graph())
-    return tag
+    nets = {"A": new_team(device), "B": new_team(device)}
+    replays = {"A": ReplayBuffer(), "B": ReplayBuffer()}
+    lb = Leaderboard(); lb.ensure("A_current"); lb.ensure("B_current")
 
+    rounds = cfg["rounds"]
+    spj = cfg["selfplay_jobs_per_round"]
+    gpj = cfg["games_per_job"]
+    sims = cfg["selfplay_sims"]
+    eval_sims = cfg["eval_sims"]
+    train_steps = cfg["train_steps"]
+    batch_size = cfg["batch_size"]
+    lr = cfg["learning_rate"]
+    eval_games = cfg["eval_games"]
 
-def evaluate_current_pair(state, sims, games):
-    wins_a = 0; half = max(1, games // 2)
-    da, db = [], []
-    for _ in range(half):
-        res = play_match(state.nets["A"], state.nets["B"], state.device, state.device, sims, True)
-        wins_a += 1 if res["winner"] == 1 else 0
-        da.append(res["diag_black"]); db.append(res["diag_white"])
-    for _ in range(games - half):
-        res = play_match(state.nets["B"], state.nets["A"], state.device, state.device, sims, True)
-        if res["winner"] == -1: wins_a += 1
-        db.append(res["diag_black"]); da.append(res["diag_white"])
-    arb = play_vs_random(state.nets["A"], state.device, sims, max(4, games // 2), True)
-    arw = play_vs_random(state.nets["A"], state.device, sims, max(4, games // 2), False)
-    brb = play_vs_random(state.nets["B"], state.device, sims, max(4, games // 2), True)
-    brw = play_vs_random(state.nets["B"], state.device, sims, max(4, games // 2), False)
-    return {"games": games, "wins_A": wins_a, "wins_B": games - wins_a, "draws": 0,
-            "A_vs_random": {"as_black": arb["win_rate"], "as_white": arw["win_rate"]},
-            "B_vs_random": {"as_black": brb["win_rate"], "as_white": brw["win_rate"]},
-            "avg_gate": {
-                "A": np.mean(da, axis=0).tolist() if da else [0.0] * len(EXPERT_NAMES),
-                "B": np.mean(db, axis=0).tolist() if db else [0.0] * len(EXPERT_NAMES)}}
+    total_games_per_net = spj * gpj
 
+    # Stage 0
+    section("STAGE 0 EVALUATION")
+    s0 = evaluate_pair(nets, device, eval_sims, eval_games)
+    json_dump({"stage": "stage0", **s0, "timestamp": now_ts()}, run_dir / "reports" / "stage0.json")
+    print(f"  A wins {s0['wins_A']}/{s0['games']}, A-vs-rand={s0['A_vs_random']}, B-vs-rand={s0['B_vs_random']}")
 
-def build_stage_report(run_dir, stage_name, ridx, state, eval_summary, extra=None):
-    report = {"stage": stage_name, "timestamp": now_ts(), "round": ridx,
-              "leaderboard": state.leaderboard.top(),
-              "worker_count": len(state.workers), "workers": list(state.workers.values()),
-              "evaluation": eval_summary,
-              "graphs": {"A": state.nets["A"].snapshot_graph(), "B": state.nets["B"].snapshot_graph()}}
-    if extra: report.update(extra)
-    safe_json_dump(run_dir / "reports" / f"{stage_name}.json", report)
-    return report
-
-
-def write_run_summary(run_dir, config, stage_reports):
-    lines = ["# EXOSFEAR MicroGo KG Distributed Run", "",
-             f"Expert node-nets per team: {', '.join(EXPERT_NAMES)}", "",
-             "## Config", "```json", json.dumps(config, indent=2), "```", ""]
-    for sn in ["stage0", "midstage", "completed"]:
-        r = stage_reports.get(sn)
-        if r:
-            lines += [f"## {sn}", "```json", json.dumps(r, indent=2), "```", ""]
-    save_text(run_dir / "RUN_SUMMARY.md", "\n".join(lines))
-
-
-# ── Coordinator pipeline ──────────────────────────────────────────────
-def coordinator_pipeline(config):
-    set_global_seed(int(config.get("seed", SEED)))
-    run_dir = Path(config["run_dir"]); run_dir.mkdir(parents=True, exist_ok=True)
-    safe_json_dump(run_dir / "config.json", config)
-    state = CoordinatorState(run_dir, config["token"], config["device"],
-                             int(config["coord_port"]), config.get("open_pairing", True))
-    srv = start_coordinator_server(state, config["coord_host"], int(config["coord_port"]))
-    lan_ip = my_lan_ip()
-    port = config["coord_port"]
-    coord_url = f"http://{lan_ip}:{port}"
-
-    # ── Start UDP beacon so workers auto-discover ──
-    start_beacon(coord_url, config["token"], interval=2.0)
-
-    print(f"\n{'='*60}")
-    print(f"  COORDINATOR RUNNING")
-    print(f"  HTTP : {coord_url}")
-    print(f"  Token: {config['token']}")
-    print(f"  Device: {config['device']}")
-    print(f"  UDP beacon broadcasting on port {BEACON_PORT}")
-    print(f"{'='*60}")
-    print(f"\n  >>> On OTHER machines, just run:")
-    print(f"  >>> python {os.path.basename(__file__)} --mode worker")
-    print(f"  >>> (they will auto-discover this coordinator)")
-    print(f"{'='*60}\n")
-
-    local_ws = None
-    if config.get("local_worker"):
-        lwp = int(config["local_worker_port"])
-        local_ws = start_worker_health_server("0.0.0.0", lwp, config["token"],
-            {"host": "127.0.0.1", "port": lwp, "device": config["device"], "role": "local_worker"})
-        threading.Thread(target=worker_loop, daemon=True,
-            kwargs={"coordinator_url": f"http://127.0.0.1:{port}",
-                    "token": config["token"], "host": "127.0.0.1",
-                    "port": lwp, "device": config["device"]}).start()
-        print(f"  Local worker started on port {lwp}")
-
-    stage_reports: Dict[str, Dict] = {}
-    print("\n  Running stage-0 evaluation...")
-    s0 = evaluate_current_pair(state, int(config["eval_sims"]), int(config["stage_eval_games"]))
-    stage_reports["stage0"] = build_stage_report(run_dir, "stage0", 0, state, s0)
-    print(f"  Stage 0: A wins {s0['wins_A']}/{s0['games']}, "
-          f"A vs random {s0['A_vs_random']}, B vs random {s0['B_vs_random']}")
-
-    rounds = int(config["rounds"])
-    spj = int(config["selfplay_jobs_per_round"])
-    gpj = int(config["games_per_job"])
-    ss = int(config["selfplay_sims"])
-    ts = int(config["train_steps_per_round"])
-    bs = int(config["batch_size"])
-    lr = float(config["learning_rate"])
-    mid = max(1, math.ceil(rounds / 2))
+    mid_round = max(1, math.ceil(rounds / 2))
 
     for ri in range(1, rounds + 1):
-        print(f"\n{'─'*50}")
-        print(f"  Round {ri}/{rounds}")
-        expected = 0
-        for nn in ["A", "B"]:
-            for ji in range(spj):
-                expected += 1
-                state.jobs.put(Job(f"r{ri:03d}_{nn}_{ji}", "selfplay", nn, ss, {"games": gpj}))
-        print(f"  Queued {expected} self-play jobs, waiting for workers...")
-        results = wait_for_results(state, expected)
-        by_net = {"A": 0, "B": 0}; ts_net = {"A": 0, "B": 0}
-        gbn: Dict[str, List] = {"A": [], "B": []}
-        for res in results:
-            nn = res["net_name"]
-            packed = decompress_obj(res["samples"])
-            samps = [Sample(np.array(i[0], dtype=np.float32), np.array(i[1], dtype=np.float32), float(i[2])) for i in packed]
-            state.replays[nn].add_many(samps)
-            ts_net[nn] += len(samps); by_net[nn] += len(res.get("results", []))
-            if res.get("avg_gate"): gbn[nn].append(res["avg_gate"])
-        print(f"  Games: A={by_net['A']} B={by_net['B']}  Samples: A={ts_net['A']} B={ts_net['B']}")
+        section(f"ROUND {ri}/{rounds}")
 
-        tr = {}
+        for net_name in ["A", "B"]:
+            short_line(f"Self-play: team {net_name}")
+            model_b64 = net_to_b64(nets[net_name])
+
+            results = push_selfplay_distributed(
+                model_b64, sims, total_games_per_net,
+                worker_urls, token, include_local, device,
+            )
+
+            total_samples = 0
+            total_g = 0
+            for res in results:
+                packed = decompress_obj(res["samples"])
+                samps = [Sample(np.array(i[0], dtype=np.float32),
+                                np.array(i[1], dtype=np.float32),
+                                float(i[2])) for i in packed]
+                replays[net_name].add(samps)
+                total_samples += len(samps)
+                total_g += len(res.get("results", []))
+                wn = res.get("worker_name", "?")
+                ws = res.get("seconds", 0)
+                print(f"    {wn}: {len(res.get('results',[]))} games, "
+                      f"{len(samps)} samples, {ws:.1f}s")
+
+            print(f"  Total: {total_g} games, {total_samples} samples, "
+                  f"replay={replays[net_name].size()}")
+
+        # Train
+        short_line("Training")
         for n in ["A", "B"]:
-            tr[n] = train_team(state.nets[n], state.replays[n], state.device, ts, bs, lr)
-            if tr[n]["total_loss"] is not None:
-                print(f"  Train {n}: loss={tr[n]['total_loss']:.4f} (pol={tr[n]['policy_loss']:.4f} val={tr[n]['value_loss']:.4f})")
-
-        ev = evaluate_current_pair(state, int(config["eval_sims"]), int(config["round_eval_games"]))
-        sa = ev["wins_A"] / max(1, ev["games"])
-        state.leaderboard.update("A_current", "B_current", sa)
-        sna = save_checkpoint(run_dir, "A", state.nets["A"], ri)
-        snb = save_checkpoint(run_dir, "B", state.nets["B"], ri)
-        state.leaderboard.ensure(sna, state.leaderboard.ratings["A_current"])
-        state.leaderboard.ensure(snb, state.leaderboard.ratings["B_current"])
-        print(f"  Eval: A wins {ev['wins_A']}/{ev['games']}  "
-              f"A-vs-rand {ev['A_vs_random']}  B-vs-rand {ev['B_vs_random']}")
-        print(f"  Leaderboard: {state.leaderboard.top()[:4]}")
-
-        rr = {"round": ri, "games": by_net, "samples": ts_net,
-              "replay": {n: state.replays[n].size() for n in ["A","B"]},
-              "train": tr, "eval": ev,
-              "selfplay_gate": {n: np.mean(gbn[n], 0).tolist() if gbn[n] else [0.0]*len(EXPERT_NAMES) for n in ["A","B"]}}
-        state.round_stats.append(rr)
-        safe_json_dump(run_dir / "rounds" / f"round_{ri:03d}.json", rr)
-
-        if ri == mid:
-            stage_reports["midstage"] = build_stage_report(run_dir, "midstage", ri, state, ev,
-                {"replay": {n: state.replays[n].size() for n in ["A","B"]}, "train": tr})
-        if ri == rounds:
-            stage_reports["completed"] = build_stage_report(run_dir, "completed", ri, state, ev,
-                {"replay": {n: state.replays[n].size() for n in ["A","B"]}, "train": tr})
-
-    write_run_summary(run_dir, config, stage_reports)
-    safe_json_dump(run_dir / "leaderboard.json", {"ratings": state.leaderboard.top()})
-    print(f"\n{'='*60}")
-    print(f"  Run complete!  Summary: {run_dir / 'RUN_SUMMARY.md'}")
-    print(f"  Leaderboard: {state.leaderboard.top()}")
-    print(f"{'='*60}")
-    srv.shutdown()
-    if local_ws: close_server(local_ws)
-
-
-# ── Turnkey config builders ───────────────────────────────────────────
-def default_coordinator_config() -> Dict[str, Any]:
-    token = gen_token()
-    coord_port = free_port(DEFAULT_COORD_PORT)
-    lwp = free_port(DEFAULT_WORKER_PORT)
-    return {
-        "token": token,
-        "coord_host": "0.0.0.0",
-        "coord_port": coord_port,
-        "run_dir": "microgo_exosfear_kg_run",
-        "device": choose_device(),
-        "seed": SEED,
-        "rounds": 6,
-        "selfplay_jobs_per_round": 2,
-        "games_per_job": 2,
-        "selfplay_sims": 20,
-        "eval_sims": 28,
-        "train_steps_per_round": 60,
-        "batch_size": 64,
-        "learning_rate": 0.001,
-        "stage_eval_games": 8,
-        "round_eval_games": 8,
-        "local_worker": True,
-        "local_worker_port": lwp,
-        "worker_urls": [],
-        "open_pairing": True,
-    }
-
-
-def coordinator_wizard() -> Dict[str, Any]:
-    cfg = default_coordinator_config()
-    print(f"\n  Coordinator quick-setup (press Enter to accept defaults)\n")
-    print(f"  Token        : {cfg['token']}")
-    print(f"  Port         : {cfg['coord_port']}")
-    print(f"  Device       : {cfg['device']}")
-    print(f"  Run dir      : {cfg['run_dir']}")
-    print(f"  Rounds       : {cfg['rounds']}")
-    print(f"  Local worker : yes (port {cfg['local_worker_port']})")
-    print(f"  Beacon       : UDP port {BEACON_PORT} (workers auto-discover)")
-    print()
-    if not prompt_yes_no("Use these defaults?", True):
-        cfg["coord_port"] = prompt_int("Coordinator port", cfg["coord_port"], 1)
-        cfg["device"] = prompt_default("Device (cpu/cuda)", cfg["device"])
-        cfg["run_dir"] = prompt_default("Run directory", cfg["run_dir"])
-        cfg["rounds"] = prompt_int("Rounds", cfg["rounds"], 1)
-        cfg["selfplay_jobs_per_round"] = prompt_int("Self-play jobs/round/net", cfg["selfplay_jobs_per_round"], 1)
-        cfg["games_per_job"] = prompt_int("Games per job", cfg["games_per_job"], 1)
-        cfg["selfplay_sims"] = prompt_int("MCTS sims (self-play)", cfg["selfplay_sims"], 1)
-        cfg["eval_sims"] = prompt_int("MCTS sims (eval)", cfg["eval_sims"], 1)
-        cfg["train_steps_per_round"] = prompt_int("Train steps/round/net", cfg["train_steps_per_round"], 1)
-        cfg["local_worker"] = prompt_yes_no("Run local worker?", True)
-        if cfg["local_worker"]:
-            cfg["local_worker_port"] = prompt_int("Local worker port", cfg["local_worker_port"], 1)
-    return cfg
-
-
-# ── CLI ────────────────────────────────────────────────────────────────
-def print_banner():
-    print("=" * 68)
-    print("  EXOSFEAR MicroGo KG Distributed")
-    print("  6x6 self-play lab · two graph-team players · LAN auto-discovery")
-    print(f"  Expert nodes: {', '.join(EXPERT_NAMES)}")
-    print("  Coordinator broadcasts UDP beacon; workers auto-find it.")
-    print("  Warning: can be compute-intensive. Start small.")
-    print("=" * 68)
-
-
-def parse_args():
-    ap = argparse.ArgumentParser(description="EXOSFEAR MicroGo KG Distributed")
-    ap.add_argument("--mode", choices=["coordinator", "worker", "inspect"],
-                    default=None, help="Skip interactive menu")
-    ap.add_argument("--run-dir", default="microgo_exosfear_kg_run")
-    ap.add_argument("--coord-url", default=None, help="Coordinator URL (worker mode, skips beacon)")
-    ap.add_argument("--token", default=None)
-    ap.add_argument("--host", default=None)
-    ap.add_argument("--port", type=int, default=None)
-    ap.add_argument("--device", default=None)
-    return ap.parse_args()
-
-
-def run_worker(args):
-    """Turnkey worker: auto-discover coordinator, auto-fetch token, start."""
-    device = args.device or choose_device()
-    host = args.host or my_lan_ip()
-    port = args.port or free_port(DEFAULT_WORKER_PORT)
-
-    coord_url = args.coord_url
-    token = args.token
-
-    # Step 1: find coordinator
-    if coord_url and token:
-        print(f"  Using provided coordinator: {coord_url}")
-    elif coord_url and not token:
-        print(f"  Coordinator URL given, fetching token...")
-        try:
-            info = http_get_json(coord_url.rstrip("/") + "/pair/bootstrap", timeout=5.0)
-            token = info.get("token", "")
-            if token:
-                print(f"  ✓ Token fetched from coordinator.")
+            tr = train_team(nets[n], replays[n], device, train_steps, batch_size, lr)
+            if tr["total_loss"] is not None:
+                print(f"  {n}: loss={tr['total_loss']:.4f} "
+                      f"(pol={tr['policy_loss']:.4f} val={tr['value_loss']:.4f})")
             else:
-                print(f"  ✗ No token returned. Check coordinator.")
-                return
-        except Exception as exc:
-            print(f"  ✗ Cannot reach {coord_url}: {exc}")
-            return
+                print(f"  {n}: not enough samples yet")
+
+        # Eval
+        short_line("Evaluation")
+        ev = evaluate_pair(nets, device, eval_sims, eval_games)
+        sa = ev["wins_A"] / max(1, ev["games"])
+        lb.update("A_current", "B_current", sa)
+        print(f"  A wins {ev['wins_A']}/{ev['games']}, "
+              f"A-vs-rand={ev['A_vs_random']}, B-vs-rand={ev['B_vs_random']}")
+        print(f"  Leaderboard: {lb.top()[:4]}")
+
+        # Save checkpoints
+        for n in ["A", "B"]:
+            tag = f"{n}_r{ri:03d}"
+            ckpt = run_dir / "checkpoints" / f"{tag}.pt"
+            ensure_dir(ckpt.parent)
+            torch.save(nets[n].state_dict(), ckpt)
+            lb.ensure(tag, lb.ratings[f"{n}_current"])
+
+        # Save round report
+        rr = {"round": ri, "eval": ev,
+              "replay": {n: replays[n].size() for n in ["A", "B"]},
+              "leaderboard": lb.top()[:6]}
+        json_dump(rr, run_dir / "reports" / f"round_{ri:03d}.json")
+
+        if ri == mid_round:
+            json_dump({"stage": "midstage", **rr, "timestamp": now_ts()},
+                      run_dir / "reports" / "midstage.json")
+        if ri == rounds:
+            json_dump({"stage": "completed", **rr, "timestamp": now_ts()},
+                      run_dir / "reports" / "completed.json")
+
+    # Summary
+    json_dump({"ratings": lb.top()}, run_dir / "leaderboard.json")
+    summary = [
+        "# EXOSFEAR MicroGo KG Run", "",
+        f"Expert nodes: {', '.join(EXPERT_NAMES)}", "",
+        "## Config", "```json", json.dumps(cfg, indent=2), "```", "",
+        "## Leaderboard", "```json", json.dumps(lb.top(), indent=2), "```",
+    ]
+    (run_dir / "RUN_SUMMARY.md").write_text("\n".join(summary), encoding="utf-8")
+
+    section("RUN COMPLETE")
+    print(f"  Summary: {run_dir / 'RUN_SUMMARY.md'}")
+    print(f"  Leaderboard: {lb.top()[:6]}")
+
+
+# ── Startup wizard ─────────────────────────────────────────────────────
+def worker_onboarding() -> None:
+    section("START MICROGO WORKER SERVER")
+    ips = get_local_ips()
+    if ips:
+        print("Detected local IPv4 addresses:")
+        for ip in ips: print(f"  - {ip}")
+
+    host = prompt_str("Bind host", "0.0.0.0")
+    suggested = find_free_port(host, 8765)
+    port = prompt_int("Port", suggested, 1, 65535)
+    while not port_is_free(host, port):
+        print(f"Port {port} is busy.")
+        suggested = find_free_port(host, port + 1)
+        port = prompt_int("Choose a free port", suggested, 1, 65535)
+    token = prompt_generated_token()
+    device = prompt_str("Device (cpu/cuda)", choose_device())
+
+    print()
+    print("Share one of these URLs with the coordinator:")
+    if ips:
+        for ip in ips: print(f"  http://{ip}:{port}")
     else:
-        # Auto-discover via beacon
-        coord_url, token = discover_coordinator(timeout=120.0)
-        if not coord_url:
-            print("\n  Auto-discovery failed. You can also run with:")
-            print(f"    python {os.path.basename(__file__)} --mode worker --coord-url http://COORDINATOR_IP:PORT")
-            manual = prompt_default("Or enter coordinator URL now (blank to quit)", "")
-            if not manual.strip():
-                return
-            coord_url = manual.strip()
-            try:
-                info = http_get_json(coord_url.rstrip("/") + "/pair/bootstrap", timeout=5.0)
-                token = info.get("token", "")
-            except Exception as exc:
-                print(f"  ✗ Cannot reach {coord_url}: {exc}")
-                return
-            if not token:
-                print(f"  ✗ No token. Check coordinator.")
-                return
+        print(f"  http://<this-machine-ip>:{port}")
+    print(f"Token: {token or '<none>'}")
+    print()
 
-    # Step 2: verify connection
-    coord_url = coord_url.rstrip("/")
-    if not verify_coordinator(coord_url, token):
-        print("  Retrying in 3s...")
-        time.sleep(3)
-        if not verify_coordinator(coord_url, token):
-            print("  Cannot connect. Check firewall / network.")
-            print("  On Windows: allow Python through Windows Firewall.")
-            return
-
-    # Step 3: start
-    srv = start_worker_health_server(host, port, token,
-        {"host": host, "port": port, "device": device, "role": "worker"})
-    print(f"\n{'='*60}")
-    print(f"  WORKER RUNNING")
-    print(f"  Coordinator : {coord_url}")
-    print(f"  This worker : http://{host}:{port}")
-    print(f"  Device      : {device}")
-    print(f"  Waiting for jobs from coordinator...")
-    print(f"{'='*60}\n")
+    httpd = start_worker_server(host, port, token, device)
+    section("WORKER READY — waiting for jobs from coordinator")
+    print(json.dumps({"worker_name": WORKER_CTX["name"],
+                      "bind": f"http://{host}:{port}",
+                      "device": device,
+                      "token_enabled": bool(token)}, indent=2))
+    print("Press Ctrl+C to stop.\n")
     try:
-        worker_loop(coord_url, token, host, port, device)
+        httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n  Worker stopped.")
-    close_server(srv)
+        print("\nWorker stopped.")
 
 
-def inspector(run_dir: Path) -> None:
-    print(f"Inspecting {run_dir}")
-    for name in ["config.json"]:
-        p = run_dir / name
-        if p.exists():
-            print(f"\n--- {name} ---")
-            print(p.read_text(encoding="utf-8"))
-    for name in ["stage0", "midstage", "completed"]:
-        p = run_dir / "reports" / f"{name}.json"
-        if p.exists():
-            print(f"\n--- {name} ---")
-            print(p.read_text(encoding="utf-8"))
-    lb = run_dir / "leaderboard.json"
-    if lb.exists():
-        print(f"\n--- leaderboard ---")
-        print(lb.read_text(encoding="utf-8"))
+def prompt_worker_urls_smart(default_port: int, token: str) -> List[str]:
+    ips = get_local_ips()
+    discovered: List[str] = []
+    if ips:
+        print("Local machine IPv4 addresses:")
+        for ip in ips: print(f"  - {ip}")
+        if prompt_bool(f"Scan local /24 for MicroGo workers on port {default_port}", True):
+            seen = set()
+            for ip in ips:
+                short_line(f"Scanning around {ip}/24 ...")
+                found = scan_subnet_for_workers(ip, default_port, token)
+                for row in found:
+                    url = row.get("url", "").rstrip("/")
+                    if url and url not in seen:
+                        seen.add(url)
+                        discovered.append(url)
+                        print(f"  ✓ Found: {url}  ({row.get('worker_name', '?')})")
+                if not found:
+                    print("  No workers found on that subnet.")
+    default_text = ", ".join(discovered)
+    try:
+        raw = input(f"Worker URLs, comma-separated [{default_text}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+    text = raw or default_text
+    out: List[str] = []
+    for part in text.split(","):
+        u = normalize_worker_url(part, default_port)
+        if u and u not in out: out.append(u)
+    return out
+
+
+def coordinator_onboarding() -> None:
+    section("EXOSFEAR MICROGO KG DISTRIBUTED — COORDINATOR")
+    print("Start workers on other machines FIRST, then run this.\n")
+
+    run_dir = prompt_str("Run directory", "microgo_exosfear_kg_run")
+    device = prompt_str("Device (cpu/cuda)", choose_device())
+    rounds = prompt_int("Rounds", 6, 1)
+    spj = prompt_int("Self-play jobs per round per net", 2, 1)
+    gpj = prompt_int("Games per self-play job", 2, 1)
+    selfplay_sims = prompt_int("MCTS sims (self-play)", 20, 1)
+    eval_sims = prompt_int("MCTS sims (eval)", 28, 1)
+    train_steps = prompt_int("Train steps per round per net", 60, 1)
+    batch_size = prompt_int("Batch size", 64, 8)
+    lr_str = prompt_str("Learning rate", "0.001")
+    lr = float(lr_str)
+    eval_games = prompt_int("Eval games per round", 8, 2)
+
+    print("\nCluster setup")
+    print("The shared token is a password used on every worker + coordinator.")
+    token = prompt_generated_token()
+    worker_port = prompt_int("Worker port to scan for", 8765, 1, 65535)
+    worker_urls = prompt_worker_urls_smart(worker_port, token)
+    include_local = prompt_bool("Also run self-play locally on this machine", True)
+    print()
+
+    cfg = {
+        "run_dir": run_dir, "device": device, "rounds": rounds,
+        "selfplay_jobs_per_round": spj, "games_per_job": gpj,
+        "selfplay_sims": selfplay_sims, "eval_sims": eval_sims,
+        "train_steps": train_steps, "batch_size": batch_size,
+        "learning_rate": lr, "eval_games": eval_games,
+        "token": token, "worker_urls": worker_urls,
+        "include_local": include_local,
+    }
+    run_pipeline(cfg)
+
+
+def inspect_run(run_dir: Path) -> None:
+    section("INSPECT RUN")
+    for rel in ["config.json", "reports/stage0.json", "reports/midstage.json",
+                "reports/completed.json", "leaderboard.json", "RUN_SUMMARY.md"]:
+        p = run_dir / rel
+        status = "OK" if p.exists() else "MISSING"
+        print(f"  {status:7s} {p}")
+        if p.exists() and p.suffix == ".json":
+            print(f"    {p.read_text(encoding='utf-8')[:300]}")
     summ = run_dir / "RUN_SUMMARY.md"
     if summ.exists():
-        print(f"\n{'─'*60}")
-        print(summ.read_text(encoding="utf-8"))
+        print("\n" + summ.read_text(encoding="utf-8"))
 
 
-def main():
-    print_banner()
-    args = parse_args()
+def startup_wizard() -> None:
+    section("EXOSFEAR MICROGO KG DISTRIBUTED")
+    print("Choose mode:")
+    print("  1) Coordinator  (start workers first, then run this)")
+    print("  2) Worker       (start this first, on each worker machine)")
+    print("  3) Inspect      (view results of a previous run)")
+    try:
+        choice = input("Select [1]: ").strip() or "1"
+    except (EOFError, KeyboardInterrupt):
+        choice = "1"
 
-    mode = args.mode
-    if mode is None:
-        print("\nChoose mode:")
-        print("  1) Coordinator  (start here first)")
-        print("  2) Worker       (start on other machines — auto-discovers coordinator)")
-        print("  3) Inspect      (view results of a previous run)")
-        choice = prompt_default("Select", "1")
-        mode = {"1": "coordinator", "2": "worker", "3": "inspect"}.get(choice, "coordinator")
-
-    if mode == "coordinator":
-        cfg = coordinator_wizard()
-        coordinator_pipeline(cfg)
-
-    elif mode == "worker":
-        run_worker(args)
-
+    if choice == "1":
+        coordinator_onboarding()
+    elif choice == "2":
+        worker_onboarding()
+    elif choice == "3":
+        run_dir = prompt_path("Run directory", "microgo_exosfear_kg_run")
+        inspect_run(run_dir)
     else:
-        run_dir = Path(args.run_dir)
-        if not run_dir.exists():
-            run_dir = Path(prompt_default("Run directory to inspect", str(run_dir)))
-        inspector(run_dir)
+        print("Unknown choice.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="EXOSFEAR MicroGo KG Distributed")
+    parser.add_argument("--mode", choices=["menu", "worker", "coordinator", "inspect"],
+                        default="menu")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--token", default="")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--run-dir", default="microgo_exosfear_kg_run")
+    args = parser.parse_args()
+
+    if args.mode == "worker":
+        device = args.device or choose_device()
+        httpd = start_worker_server(args.host, args.port, args.token, device)
+        section("WORKER READY")
+        ips = get_local_ips()
+        print(f"  Listening on http://{args.host}:{args.port}")
+        if ips:
+            for ip in ips:
+                print(f"  Reachable at http://{ip}:{args.port}")
+        print(f"  Device: {device}")
+        print(f"  Token: {'enabled' if args.token else 'none'}")
+        print("  Press Ctrl+C to stop.\n")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        return
+
+    if args.mode == "coordinator":
+        coordinator_onboarding()
+        return
+
+    if args.mode == "inspect":
+        inspect_run(Path(args.run_dir))
+        return
+
+    startup_wizard()
 
 
 if __name__ == "__main__":
