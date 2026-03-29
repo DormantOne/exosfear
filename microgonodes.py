@@ -335,7 +335,7 @@ if not MOCK_MODE:
             s.expert_token=nn.Parameter(torch.randn(ne,dd)*0.05);s.router=nn.Sequential(nn.Linear(ch+3,64),nn.ReLU(),nn.Linear(64,ne))
             s.edge_logits=nn.Parameter(torch.zeros(ne,ne));s.conf_head=nn.Linear(dd,1);s.router_temp=nn.Parameter(torch.tensor(1.0))
         def graph_matrix(s):return torch.softmax(s.edge_logits,dim=-1)
-        def forward(s,x,kf=None,return_aux=False):
+        def forward(s,x,kf=None,return_aux=False,expert_dropout=False):
             ne=len(s.expert_names);base=s.shared(s.stem(x));pool=F.adaptive_avg_pool2d(base,1).flatten(1)
             rl=s.router(torch.cat([pool,x[:,4].mean((1,2)).unsqueeze(-1),x[:,3].mean((1,2)).unsqueeze(-1),x[:,2].mean((1,2)).unsqueeze(-1)],-1))
             ps,vs,ds=[],[],[]
@@ -344,12 +344,22 @@ if not MOCK_MODE:
             kl,kv,kd=s.kg_expert(kf);ps.append(kl);vs.append(kv);ds.append(kd+s.expert_token[ne-1].unsqueeze(0))
             PS=torch.stack(ps,1);VS=torch.stack(vs,1);DS=torch.stack(ds,1)
             edges=s.graph_matrix();md=torch.einsum("ij,bjd->bid",edges,DS);conf=s.conf_head(torch.tanh(DS+md)).squeeze(-1)
-            temp=torch.clamp(s.router_temp.abs(),0.3,3.0);w=torch.softmax((rl+conf)/temp,dim=-1)
+            # Temperature floor at 1.0 to prevent sharpening collapse
+            temp=torch.clamp(s.router_temp.abs(),1.0,3.0)
+            w=torch.softmax((rl+conf)/temp,dim=-1)
+            # Expert dropout: during training, randomly mask the dominant expert 30% of the time
+            if expert_dropout and s.training:
+                mask=torch.ones_like(w)
+                top_idx=w.detach().argmax(dim=-1)  # [batch]
+                drop=torch.rand(w.shape[0],device=w.device)<0.3  # 30% of batch
+                for bi in range(w.shape[0]):
+                    if drop[bi]:mask[bi,top_idx[bi]]=0.0
+                w=w*mask;wsum=w.sum(-1,keepdim=True).clamp(min=1e-8);w=w/wsum
             fp=(PS*w.unsqueeze(-1)).sum(1);fv=(VS*w).sum(1)
             if not return_aux:return fp,fv
             return fp,fv,{"weights":w,"conf":conf}
         def snapshot_graph(s):
-            with torch.no_grad():return{"experts":list(s.expert_names),"edges":s.graph_matrix().cpu().numpy().tolist(),"temp":float(torch.clamp(s.router_temp.abs(),0.3,3.0).cpu())}
+            with torch.no_grad():return{"experts":list(s.expert_names),"edges":s.graph_matrix().cpu().numpy().tolist(),"temp":float(torch.clamp(s.router_temp.abs(),1.0,3.0).cpu())}
     def new_team(d):n=GraphTeamNet();n.to(d);n.eval();return n
     def net_to_b64(n):b=io.BytesIO();torch.save(n.state_dict(),b);return base64.b64encode(gzip.compress(b.getvalue())).decode("ascii")
     def net_from_b64(p,d):n=new_team(d);n.load_state_dict(torch.load(io.BytesIO(gzip.decompress(base64.b64decode(p.encode("ascii")))),map_location=d,weights_only=False));n.eval();return n
@@ -447,15 +457,32 @@ if not MOCK_MODE:
             res=self_play_game(net,dev,sims,rn);results.append({k:v for k,v in res.items() if k!="samples"})
             for s in res["samples"]:packed.append([s.sp.tolist(),s.pol.tolist(),float(s.z)])
         return{"results":results,"samples":compress_obj(packed),"regime_stats":REGIMES.stats()}
-    def train_team(net,replay,dev,steps=100,bs=64,lr=1e-3):
+    def train_team(net,replay,dev,steps=100,bs=64,lr=1e-3,lb_coeff=0.1):
         if replay.size()<bs:return{"steps":0,"total_loss":None}
-        net.train();opt=torch.optim.AdamW(net.parameters(),lr=lr,weight_decay=1e-4);tl=[]
+        ne=len(EXPERT_NAMES)
+        net.train();opt=torch.optim.AdamW(net.parameters(),lr=lr,weight_decay=1e-4);tl=[];bl=[]
         for _ in range(steps):
             b=replay.sample_batch(bs)
             if not b:break
-            x,pt,z=[torch.from_numpy(a).to(dev) for a in b];lo,va=net(x);loss=-(pt*F.log_softmax(lo,-1)).sum(-1).mean()+F.mse_loss(va,z)
-            opt.zero_grad(set_to_none=True);loss.backward();torch.nn.utils.clip_grad_norm_(net.parameters(),1.0);opt.step();tl.append(float(loss.cpu()))
-        net.eval();return{"steps":len(tl),"total_loss":float(np.mean(tl)) if tl else None,"graph":net.snapshot_graph()}
+            x,pt,z=[torch.from_numpy(a).to(dev) for a in b]
+            # Forward with aux + expert dropout
+            lo,va,aux=net(x,return_aux=True,expert_dropout=True)
+            ploss=-(pt*F.log_softmax(lo,-1)).sum(-1).mean()
+            vloss=F.mse_loss(va,z)
+            # Load-balancing loss: penalize concentration
+            # Switch Transformer style: ne * sum(fraction_i * router_prob_i)
+            # Drives toward uniform 1/ne usage across batch
+            w=aux["weights"]  # [batch, ne]
+            frac=w.mean(0)  # avg weight per expert across batch
+            # Ideal: each expert gets 1/ne fraction
+            # Penalty: squared deviation from uniform
+            lb_loss=ne*(frac*frac).sum()  # minimized when frac=[1/ne,...,1/ne]
+            loss=ploss+vloss+lb_coeff*lb_loss
+            opt.zero_grad(set_to_none=True);loss.backward();torch.nn.utils.clip_grad_norm_(net.parameters(),1.0);opt.step()
+            tl.append(float((ploss+vloss).cpu()));bl.append(float(lb_loss.cpu()))
+        net.eval()
+        return{"steps":len(tl),"total_loss":float(np.mean(tl)) if tl else None,
+               "balance_loss":float(np.mean(bl)) if bl else None,"graph":net.snapshot_graph()}
     def evaluate_pair(nets,dev,sims,games):
         def pm(nb,nw):
             st=GoState.new()
@@ -770,7 +797,7 @@ def _rt():
         for n in["A","B"]:
             tr=train_team(ST.nets[n],ST.replays[n],ST.device,cfg["train_steps"],cfg["batch_size"],cfg["learning_rate"])
             info["l"+n.lower()]=tr.get("total_loss")
-            if tr["total_loss"]:ST._log("  "+n+":"+str(round(tr["total_loss"],4)))
+            if tr["total_loss"]:ST._log("  "+n+":"+str(round(tr["total_loss"],4))+" bal:"+str(round(tr.get("balance_loss",0),4)))
             if tr.get("graph"):info["graph"]=tr["graph"]
         ev=evaluate_pair(ST.nets,ST.device,cfg.get("eval_sims",28),cfg["eval_games"]);sa=ev["wins_A"]/max(1,ev["games"]);ST.lb.update("A_current","B_current",sa)
         info["avr"]=ev.get("A_vs_random");info["bvr"]=ev.get("B_vs_random");info["h2h"]=str(ev["wins_A"])+"/"+str(ev["games"])
