@@ -911,10 +911,12 @@ class Job:
 
 
 class CoordinatorState:
-    def __init__(self, run_dir: Path, token: str, device: str):
+    def __init__(self, run_dir: Path, token: str, device: str, coord_port: Optional[int] = None, open_pairing: bool = True):
         self.run_dir = run_dir
         self.token = token
         self.device = device
+        self.coord_port = coord_port
+        self.open_pairing = open_pairing
         self.lock = threading.Lock()
         self.jobs: "queue.Queue[Job]" = queue.Queue()
         self.completed: List[Dict[str, Any]] = []
@@ -951,7 +953,19 @@ class CoordinatorHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path.startswith("/health"):
-            maybe_json_response(self, 200, {"ok": True, "ts": now_ts(), "workers": len(self.state.workers)})
+            maybe_json_response(self, 200, {"ok": True, "ts": now_ts(), "workers": len(self.state.workers), "role": "coordinator", "open_pairing": getattr(self.state, "open_pairing", True)})
+            return
+        if self.path.startswith("/pair/bootstrap"):
+            if not getattr(self.state, "open_pairing", True):
+                maybe_json_response(self, 403, {"error": "pairing_closed"})
+                return
+            maybe_json_response(self, 200, {
+                "ok": True,
+                "token": self.state.token,
+                "coord_port": getattr(self.state, "coord_port", None),
+                "open_pairing": getattr(self.state, "open_pairing", True),
+                "ts": now_ts(),
+            })
             return
         maybe_json_response(self, 404, {"error": "not_found"})
 
@@ -1007,7 +1021,7 @@ class CoordinatorHandler(BaseHTTPRequestHandler):
 
 def start_coordinator_server(state: CoordinatorState, host: str, port: int) -> ThreadingHTTPServer:
     CoordinatorHandler.state = state
-    server = ThreadingHTTPServer((host, port), CoordinatorHandler)
+    server = ReusableThreadingHTTPServer((host, port), CoordinatorHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -1029,7 +1043,7 @@ class SimpleWorkerHandler(BaseHTTPRequestHandler):
 def start_worker_health_server(host: str, port: int, token: str, info: Dict[str, Any]) -> ThreadingHTTPServer:
     SimpleWorkerHandler.token = token
     SimpleWorkerHandler.info = info
-    server = ThreadingHTTPServer((host, port), SimpleWorkerHandler)
+    server = ReusableThreadingHTTPServer((host, port), SimpleWorkerHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -1078,6 +1092,14 @@ def scan_for_workers(port: int, timeout: float = 0.35) -> List[str]:
     for t in threads:
         t.join()
     return sorted(found)
+
+
+def scan_for_coordinators(port: int, timeout: float = 0.35) -> List[str]:
+    return scan_for_workers(port=port, timeout=timeout)
+
+
+def fetch_pairing_info(coordinator_url: str, timeout: float = 5.0) -> Dict[str, Any]:
+    return http_get_json(coordinator_url.rstrip("/") + "/pair/bootstrap", timeout=timeout)
 
 
 def worker_loop(coordinator_url: str, token: str, host: str, port: int, device: str, max_idle: int = 999999) -> None:
@@ -1265,7 +1287,7 @@ def coordinator_pipeline(config: Dict[str, Any]) -> None:
     run_dir = Path(config["run_dir"])
     run_dir.mkdir(parents=True, exist_ok=True)
     safe_json_dump(run_dir / "config.json", config)
-    state = CoordinatorState(run_dir=run_dir, token=config["token"], device=config["device"])
+    state = CoordinatorState(run_dir=run_dir, token=config["token"], device=config["device"], coord_port=int(config["coord_port"]), open_pairing=bool(config.get("open_pairing", True)))
     server = start_coordinator_server(state, config["coord_host"], int(config["coord_port"]))
     print(f"Coordinator listening on http://{config['coord_host']}:{config['coord_port']}")
 
@@ -1405,7 +1427,7 @@ def coordinator_pipeline(config: Dict[str, Any]) -> None:
     print(f"Run complete. Summary at {run_dir / 'RUN_SUMMARY.md'}")
     server.shutdown()
     if local_worker_server is not None:
-        local_worker_server.shutdown()
+        close_server(local_worker_server)
 
 
 # -----------------------------
@@ -1417,7 +1439,7 @@ def print_banner() -> None:
     print("6x6 self-play lab with two graph-team players, LAN workers, and leaderboard")
     print(f"Each team has specialist node-nets: {', '.join(EXPERT_NAMES)}")
     print("High risk: self-play + MCTS + training can become compute-intensive.")
-    print("Review settings. Start small.")
+    print("Review settings. Start small. Worker ports can be any free port; token fetch can be automatic.")
     print("=" * 76)
 
 
@@ -1442,7 +1464,7 @@ def coordinator_wizard() -> Dict[str, Any]:
     local_worker_port = free_port(DEFAULT_WORKER_PORT) if local_worker else 0
     if local_worker:
         local_worker_port = prompt_int("Local worker port", local_worker_port, 1)
-    scan_port = prompt_int("Scan for workers on port", DEFAULT_WORKER_PORT, 1)
+    scan_port = prompt_int("Optional scan for already-running workers on port", DEFAULT_WORKER_PORT, 1)
     do_scan = prompt_yes_no("Scan the local /24 subnet for workers now?", True)
     discovered = []
     if do_scan:
@@ -1461,7 +1483,7 @@ def coordinator_wizard() -> Dict[str, Any]:
     worker_urls = sorted(set(worker_urls))
     safe_json_dump(Path(run_dir) / "worker_targets.json", {"worker_urls": worker_urls})
     print("\nCoordinator quick notes:")
-    print("- Start one or more workers on your Mac/Dell with the same token.")
+    print("- Start one or more workers on your Mac/Dell; with pairing open they can fetch the token automatically.")
     print(f"- Coordinator URL workers should use: http://<COORDINATOR_IP>:{coord_port}")
     print(f"- Expert nodes per team: {', '.join(EXPERT_NAMES)}")
     return {
@@ -1484,6 +1506,7 @@ def coordinator_wizard() -> Dict[str, Any]:
         "local_worker": local_worker,
         "local_worker_port": local_worker_port,
         "worker_urls": worker_urls,
+        "open_pairing": open_pairing,
     }
 
 
@@ -1553,9 +1576,8 @@ def main() -> None:
                 "role": "worker",
             })
             print(f"Worker health server on http://{cfg['host']}:{cfg['port']}")
-            print(f"Use token: {cfg['token']}")
             worker_loop(cfg["coordinator_url"], cfg["token"], cfg["host"], int(cfg["port"]), cfg["device"])
-            server.shutdown()
+            close_server(server)
             return
         else:
             run_dir = Path(prompt_default("Run directory to inspect", args.run_dir))
@@ -1568,12 +1590,21 @@ def main() -> None:
         host = args.host or prompt_default("Worker bind host", next((ip for ip in local_ipv4_addresses() if not ip.startswith('127.')), '0.0.0.0'))
         port = args.port or prompt_int("Worker port", free_port(DEFAULT_WORKER_PORT), 1)
         device = args.device or prompt_default("Device (cpu/cuda)", choose_device())
-        token = args.token or prompt_default("Shared token", gen_token())
         coord_url = args.coord_url or prompt_default("Coordinator URL", f"http://127.0.0.1:{DEFAULT_COORD_PORT}")
+        token = args.token or ""
+        if not token:
+            try:
+                token = str(fetch_pairing_info(coord_url).get("token", ""))
+                if token:
+                    print("Fetched token from coordinator.")
+            except Exception as exc:
+                print(f"Automatic token fetch failed: {exc}")
+        if not token:
+            token = prompt_default("Session token", gen_token())
         server = start_worker_health_server(host, int(port), token, {"host": host, "port": int(port), "device": device, "role": "worker"})
         print(f"Worker health server on http://{host}:{port}")
         worker_loop(coord_url, token, host, int(port), device)
-        server.shutdown()
+        close_server(server)
     else:
         inspector(Path(args.run_dir))
 
