@@ -6,12 +6,13 @@ One-file distributed self-play training lab for 6x6 Micro Go.
 Each side is a small graph-team of specialist node-nets:
   opening, tactics, territory, endgame
 
-Workers generate self-play over LAN using plain HTTP.
-The coordinator owns checkpoints, replay buffers, training, leaderboard.
+Workers auto-discover the coordinator via UDP broadcast beacon.
+Start coordinator on one machine, worker on another — they find each other.
 
 High risk warning:
 - Self-play + MCTS + training can heavily load CPU/GPU.
 - Start tiny. Review settings before serious runs.
+- Windows Firewall: allow Python through when prompted on first run.
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ import pickle
 import queue
 import random
 import socket
+import struct
 import sys
 import threading
 import time
@@ -59,6 +61,8 @@ ALL_MOVES = BOARD_SIZE * BOARD_SIZE + 1
 KOMI = 3.5
 DEFAULT_WORKER_PORT = 8786
 DEFAULT_COORD_PORT = 8787
+BEACON_PORT = 9876
+BEACON_MAGIC = "EXOSFEAR_MICROGO_V1"
 MAX_GAME_LEN = 120
 SEED = 42
 EXPERT_NAMES = ["opening", "tactics", "territory", "endgame"]
@@ -75,6 +79,103 @@ def close_server(server: ThreadingHTTPServer) -> None:
         server.shutdown()
     except Exception:
         pass
+
+
+# ── beacon: coordinator broadcasts, worker listens ────────────────────
+def start_beacon(coord_url: str, token: str, interval: float = 2.0) -> threading.Thread:
+    """Coordinator broadcasts its address + token on LAN via UDP every interval seconds."""
+    msg = json.dumps({
+        "magic": BEACON_MAGIC,
+        "coord_url": coord_url,
+        "token": token,
+    }).encode("utf-8")
+
+    def _loop():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # Also try to set SO_REUSEADDR so multiple runs don't collide
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        while True:
+            try:
+                sock.sendto(msg, ("255.255.255.255", BEACON_PORT))
+            except Exception:
+                pass
+            # Also try subnet-directed broadcast for every local interface
+            for ip in local_ipv4_addresses():
+                if ip.startswith("127."):
+                    continue
+                parts = ip.split(".")
+                if len(parts) == 4:
+                    bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+                    try:
+                        sock.sendto(msg, (bcast, BEACON_PORT))
+                    except Exception:
+                        pass
+            time.sleep(interval)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return t
+
+
+def discover_coordinator(timeout: float = 120.0) -> Tuple[Optional[str], Optional[str]]:
+    """Worker listens for coordinator beacon on UDP. Returns (coord_url, token) or (None, None)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except Exception:
+        pass
+    try:
+        sock.bind(("0.0.0.0", BEACON_PORT))
+    except OSError as exc:
+        print(f"  Warning: could not bind UDP port {BEACON_PORT}: {exc}")
+        print(f"  Trying alternative port...")
+        try:
+            sock.bind(("0.0.0.0", BEACON_PORT + 1))
+        except OSError:
+            print(f"  Could not bind beacon listener. Enter coordinator URL manually.")
+            sock.close()
+            return None, None
+    sock.settimeout(3.0)
+    deadline = time.time() + timeout
+    print(f"\n  Listening for coordinator beacon (UDP port {BEACON_PORT})...")
+    print(f"  Make sure the coordinator is running on another machine.")
+    print(f"  Windows/macOS: allow Python through firewall when prompted!\n")
+    last_print = 0
+    while time.time() < deadline:
+        remaining = int(deadline - time.time())
+        try:
+            data, addr = sock.recvfrom(4096)
+            msg = json.loads(data.decode("utf-8"))
+            if msg.get("magic") == BEACON_MAGIC:
+                coord_url = msg["coord_url"]
+                token = msg["token"]
+                print(f"\n  ✓ Found coordinator at {coord_url}  (beacon from {addr[0]})")
+                sock.close()
+                return coord_url, token
+        except socket.timeout:
+            now = time.time()
+            if now - last_print > 3:
+                print(f"  Scanning... {remaining}s remaining  ", end="\r", flush=True)
+                last_print = now
+        except Exception:
+            pass
+    print(f"\n  No coordinator beacon found within {int(timeout)}s.")
+    sock.close()
+    return None, None
+
+
+def verify_coordinator(coord_url: str, token: str) -> bool:
+    """Quick HTTP check that coordinator is reachable and token matches."""
+    try:
+        resp = http_get_json(coord_url.rstrip("/") + "/health", timeout=5.0)
+        if resp.get("ok"):
+            print(f"  ✓ Coordinator responding at {coord_url}")
+            return True
+    except Exception as exc:
+        print(f"  ✗ Cannot reach coordinator at {coord_url}: {exc}")
+    return False
 
 
 # ── utilities ──────────────────────────────────────────────────────────
@@ -484,7 +585,7 @@ def net_bytes(net):
 def load_net_from_bytes(payload, device):
     net = new_team(device)
     raw = gzip.decompress(base64.b64decode(payload.encode("ascii")))
-    net.load_state_dict(torch.load(io.BytesIO(raw), map_location=device, weights_only=True))
+    net.load_state_dict(torch.load(io.BytesIO(raw), map_location=device, weights_only=False))
     net.eval(); return net
 
 
@@ -501,8 +602,12 @@ def infer_with_aux(net, device, state):
 # ── MCTS ───────────────────────────────────────────────────────────────
 @dataclass
 class TreeNode:
-    prior: float; to_play: int; visit_count: int = 0; value_sum: float = 0.0
-    children: Dict[int, "TreeNode"] = field(default_factory=dict); expanded: bool = False
+    prior: float
+    to_play: int
+    visit_count: int = 0
+    value_sum: float = 0.0
+    children: Dict[int, "TreeNode"] = field(default_factory=dict)
+    expanded: bool = False
     def value(self):
         return 0.0 if self.visit_count == 0 else self.value_sum / self.visit_count
 
@@ -583,7 +688,9 @@ def sample_move_from_visits(visits, state, temperature):
 # ── Replay and training ───────────────────────────────────────────────
 @dataclass
 class Sample:
-    state_planes: np.ndarray; policy: np.ndarray; z: float
+    state_planes: np.ndarray
+    policy: np.ndarray
+    z: float
 
 
 class ReplayBuffer:
@@ -732,7 +839,11 @@ class Leaderboard:
 # ── Coordinator state and server ──────────────────────────────────────
 @dataclass
 class Job:
-    job_id: str; kind: str; net_name: str; sims: int; payload: Dict[str, Any]
+    job_id: str
+    kind: str
+    net_name: str
+    sims: int
+    payload: Dict[str, Any]
 
 
 class CoordinatorState:
@@ -833,81 +944,70 @@ def start_worker_health_server(host, port, token, info):
     threading.Thread(target=srv.serve_forever, daemon=True).start(); return srv
 
 
-def scan_for_workers(port, timeout=0.35):
-    candidates = []
-    for ip in local_ipv4_addresses():
-        if ip.startswith("127."): continue
-        parts = ip.split(".")
-        if len(parts) != 4: continue
-        prefix = ".".join(parts[:3])
-        for i in range(1, 255):
-            candidates.append(f"http://{prefix}.{i}:{port}")
-    found = []; lock = threading.Lock(); q: queue.Queue[str] = queue.Queue()
-    for u in candidates: q.put(u)
-    def scan_worker():
-        while True:
-            try: url = q.get_nowait()
-            except queue.Empty: return
-            try:
-                r = http_get_json(url + "/health", timeout=timeout)
-                if r.get("ok"):
-                    with lock: found.append(url)
-            except Exception: pass
-            finally: q.task_done()
-    ts = [threading.Thread(target=scan_worker, daemon=True) for _ in range(64)]
-    for t in ts: t.start()
-    for t in ts: t.join()
-    return sorted(found)
-
-
 def worker_loop(coordinator_url, token, host, port, device, max_idle=999999):
     wid = f"{socket.gethostname()}-{sha256_text(host + str(port) + device)}"
     try:
         http_post_json(coordinator_url + "/register",
             {"token": token, "worker_id": wid, "host": host, "port": port,
              "device": device, "ts": now_ts()}, timeout=10.0)
+        print(f"  Registered with coordinator.")
     except Exception as exc:
-        print(f"  register warning: {exc}")
+        print(f"  Register warning: {exc}")
     idle = 0
+    jobs_done = 0
     while idle < max_idle:
         try:
             resp = http_post_json(coordinator_url + "/worker/pull_job",
                 {"token": token, "worker_id": wid, "host": host, "port": port, "device": device}, timeout=30.0)
         except Exception as exc:
-            print(f"  pull failed: {exc}"); time.sleep(2); idle += 1; continue
+            print(f"  Pull failed: {exc}"); time.sleep(2); idle += 1; continue
         job = resp.get("job")
         if job is None:
+            if idle % 10 == 0 and idle > 0:
+                print(f"  Waiting for jobs... (idle {idle}s, completed {jobs_done} jobs so far)")
             time.sleep(1); idle += 1; continue
         idle = 0; started = time.time()
+        print(f"  Got job: {job['job_id']} ({job['kind']})")
         net = load_net_from_bytes(job["model"], device)
         if job["kind"] == "selfplay":
             games = int(job["payload"].get("games", 1))
             results = []; packed = []; gate_means = []
-            for _ in range(games):
+            for gi in range(games):
+                print(f"    Playing game {gi+1}/{games}...", end="\r", flush=True)
                 res = self_play_game(net, device, int(job["sims"]))
                 results.append({k: v for k, v in res.items() if k != "samples"})
                 gate_means.append(res.get("avg_gate", [0.0] * len(EXPERT_NAMES)))
                 for s in res["samples"]:
                     packed.append([s.state_planes.tolist(), s.policy.tolist(), float(s.z)])
+            elapsed = time.time() - started
             out = {"token": token, "worker_id": wid, "job_id": job["job_id"],
                    "kind": "selfplay_result", "net_name": job["net_name"],
                    "results": results, "samples": compress_obj(packed),
-                   "elapsed_sec": time.time() - started,
+                   "elapsed_sec": elapsed,
                    "avg_gate": np.mean(gate_means, axis=0).tolist() if gate_means else [0.0] * len(EXPERT_NAMES)}
+            jobs_done += 1
+            print(f"  Job {job['job_id']} done: {games} games in {elapsed:.1f}s  (total jobs: {jobs_done})")
         else:
             out = {"token": token, "worker_id": wid, "job_id": job["job_id"],
                    "kind": "unknown", "net_name": job["net_name"], "elapsed_sec": time.time() - started}
         try:
             http_post_json(coordinator_url + "/worker/submit_result", out, timeout=120.0)
         except Exception as exc:
-            print(f"  submit failed: {exc}"); time.sleep(2)
+            print(f"  Submit failed: {exc}"); time.sleep(2)
 
 
 def wait_for_results(state, expected, poll=1.0):
+    t0 = time.time()
+    last_print = 0
     while True:
         with state.lock:
-            if len(state.completed) >= expected:
+            got = len(state.completed)
+            if got >= expected:
                 out = list(state.completed); state.completed.clear(); return out
+        now = time.time()
+        if now - last_print > 5:
+            print(f"  Waiting for results: {got}/{expected} (workers: {len(state.workers)}, {now-t0:.0f}s)")
+            last_print = now
         time.sleep(poll)
 
 
@@ -975,15 +1075,21 @@ def coordinator_pipeline(config):
     srv = start_coordinator_server(state, config["coord_host"], int(config["coord_port"]))
     lan_ip = my_lan_ip()
     port = config["coord_port"]
+    coord_url = f"http://{lan_ip}:{port}"
+
+    # ── Start UDP beacon so workers auto-discover ──
+    start_beacon(coord_url, config["token"], interval=2.0)
 
     print(f"\n{'='*60}")
-    print(f"  COORDINATOR RUNNING on port {port}")
+    print(f"  COORDINATOR RUNNING")
+    print(f"  HTTP : {coord_url}")
     print(f"  Token: {config['token']}")
     print(f"  Device: {config['device']}")
+    print(f"  UDP beacon broadcasting on port {BEACON_PORT}")
     print(f"{'='*60}")
-    print(f"\n  To add workers on OTHER machines, run:")
-    print(f"    python {os.path.basename(__file__)} --mode worker --coord-url http://{lan_ip}:{port}")
-    print(f"\n  Workers auto-fetch the token. No extra setup needed.")
+    print(f"\n  >>> On OTHER machines, just run:")
+    print(f"  >>> python {os.path.basename(__file__)} --mode worker")
+    print(f"  >>> (they will auto-discover this coordinator)")
     print(f"{'='*60}\n")
 
     local_ws = None
@@ -1077,7 +1183,6 @@ def coordinator_pipeline(config):
 
 # ── Turnkey config builders ───────────────────────────────────────────
 def default_coordinator_config() -> Dict[str, Any]:
-    """All-defaults config: just works with Enter-through or --mode coordinator."""
     token = gen_token()
     coord_port = free_port(DEFAULT_COORD_PORT)
     lwp = free_port(DEFAULT_WORKER_PORT)
@@ -1106,16 +1211,15 @@ def default_coordinator_config() -> Dict[str, Any]:
 
 
 def coordinator_wizard() -> Dict[str, Any]:
-    """Minimal prompts.  Press Enter for everything to get going."""
     cfg = default_coordinator_config()
-    print("\nCoordinator quick-setup (press Enter to accept all defaults)\n")
-    print(f"  Token          : {cfg['token']}")
-    print(f"  Port           : {cfg['coord_port']}")
-    print(f"  Device         : {cfg['device']}")
-    print(f"  Run dir        : {cfg['run_dir']}")
-    print(f"  Rounds         : {cfg['rounds']}")
-    print(f"  Local worker   : yes (port {cfg['local_worker_port']})")
-    print(f"  Open pairing   : yes (workers auto-fetch token)")
+    print(f"\n  Coordinator quick-setup (press Enter to accept defaults)\n")
+    print(f"  Token        : {cfg['token']}")
+    print(f"  Port         : {cfg['coord_port']}")
+    print(f"  Device       : {cfg['device']}")
+    print(f"  Run dir      : {cfg['run_dir']}")
+    print(f"  Rounds       : {cfg['rounds']}")
+    print(f"  Local worker : yes (port {cfg['local_worker_port']})")
+    print(f"  Beacon       : UDP port {BEACON_PORT} (workers auto-discover)")
     print()
     if not prompt_yes_no("Use these defaults?", True):
         cfg["coord_port"] = prompt_int("Coordinator port", cfg["coord_port"], 1)
@@ -1127,43 +1231,106 @@ def coordinator_wizard() -> Dict[str, Any]:
         cfg["selfplay_sims"] = prompt_int("MCTS sims (self-play)", cfg["selfplay_sims"], 1)
         cfg["eval_sims"] = prompt_int("MCTS sims (eval)", cfg["eval_sims"], 1)
         cfg["train_steps_per_round"] = prompt_int("Train steps/round/net", cfg["train_steps_per_round"], 1)
-        cfg["local_worker"] = prompt_yes_no("Run local worker on this machine?", True)
+        cfg["local_worker"] = prompt_yes_no("Run local worker?", True)
         if cfg["local_worker"]:
             cfg["local_worker_port"] = prompt_int("Local worker port", cfg["local_worker_port"], 1)
     return cfg
 
 
-def worker_wizard(coord_url: Optional[str] = None) -> Dict[str, Any]:
-    """Minimal worker setup: just need the coordinator URL."""
-    print("\nWorker setup")
-    if not coord_url:
-        coord_url = prompt_default("Coordinator URL", f"http://{my_lan_ip()}:{DEFAULT_COORD_PORT}")
-    coord_url = coord_url.rstrip("/")
+# ── CLI ────────────────────────────────────────────────────────────────
+def print_banner():
+    print("=" * 68)
+    print("  EXOSFEAR MicroGo KG Distributed")
+    print("  6x6 self-play lab · two graph-team players · LAN auto-discovery")
+    print(f"  Expert nodes: {', '.join(EXPERT_NAMES)}")
+    print("  Coordinator broadcasts UDP beacon; workers auto-find it.")
+    print("  Warning: can be compute-intensive. Start small.")
+    print("=" * 68)
 
-    # Try to auto-fetch token
-    token = ""
-    print(f"  Contacting coordinator at {coord_url} ...")
-    for attempt in range(3):
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="EXOSFEAR MicroGo KG Distributed")
+    ap.add_argument("--mode", choices=["coordinator", "worker", "inspect"],
+                    default=None, help="Skip interactive menu")
+    ap.add_argument("--run-dir", default="microgo_exosfear_kg_run")
+    ap.add_argument("--coord-url", default=None, help="Coordinator URL (worker mode, skips beacon)")
+    ap.add_argument("--token", default=None)
+    ap.add_argument("--host", default=None)
+    ap.add_argument("--port", type=int, default=None)
+    ap.add_argument("--device", default=None)
+    return ap.parse_args()
+
+
+def run_worker(args):
+    """Turnkey worker: auto-discover coordinator, auto-fetch token, start."""
+    device = args.device or choose_device()
+    host = args.host or my_lan_ip()
+    port = args.port or free_port(DEFAULT_WORKER_PORT)
+
+    coord_url = args.coord_url
+    token = args.token
+
+    # Step 1: find coordinator
+    if coord_url and token:
+        print(f"  Using provided coordinator: {coord_url}")
+    elif coord_url and not token:
+        print(f"  Coordinator URL given, fetching token...")
         try:
-            info = http_get_json(coord_url + "/pair/bootstrap", timeout=5.0)
+            info = http_get_json(coord_url.rstrip("/") + "/pair/bootstrap", timeout=5.0)
             token = info.get("token", "")
             if token:
-                print(f"  Token fetched automatically.")
-                break
-        except Exception as exc:
-            if attempt < 2:
-                print(f"  Attempt {attempt+1} failed ({exc}), retrying...")
-                time.sleep(2)
+                print(f"  ✓ Token fetched from coordinator.")
             else:
-                print(f"  Could not reach coordinator: {exc}")
-    if not token:
-        token = prompt_default("Enter token manually", gen_token())
+                print(f"  ✗ No token returned. Check coordinator.")
+                return
+        except Exception as exc:
+            print(f"  ✗ Cannot reach {coord_url}: {exc}")
+            return
+    else:
+        # Auto-discover via beacon
+        coord_url, token = discover_coordinator(timeout=120.0)
+        if not coord_url:
+            print("\n  Auto-discovery failed. You can also run with:")
+            print(f"    python {os.path.basename(__file__)} --mode worker --coord-url http://COORDINATOR_IP:PORT")
+            manual = prompt_default("Or enter coordinator URL now (blank to quit)", "")
+            if not manual.strip():
+                return
+            coord_url = manual.strip()
+            try:
+                info = http_get_json(coord_url.rstrip("/") + "/pair/bootstrap", timeout=5.0)
+                token = info.get("token", "")
+            except Exception as exc:
+                print(f"  ✗ Cannot reach {coord_url}: {exc}")
+                return
+            if not token:
+                print(f"  ✗ No token. Check coordinator.")
+                return
 
-    device = choose_device()
-    host = my_lan_ip()
-    port = free_port(DEFAULT_WORKER_PORT)
-    return {"host": host, "port": port, "device": device,
-            "token": token, "coordinator_url": coord_url}
+    # Step 2: verify connection
+    coord_url = coord_url.rstrip("/")
+    if not verify_coordinator(coord_url, token):
+        print("  Retrying in 3s...")
+        time.sleep(3)
+        if not verify_coordinator(coord_url, token):
+            print("  Cannot connect. Check firewall / network.")
+            print("  On Windows: allow Python through Windows Firewall.")
+            return
+
+    # Step 3: start
+    srv = start_worker_health_server(host, port, token,
+        {"host": host, "port": port, "device": device, "role": "worker"})
+    print(f"\n{'='*60}")
+    print(f"  WORKER RUNNING")
+    print(f"  Coordinator : {coord_url}")
+    print(f"  This worker : http://{host}:{port}")
+    print(f"  Device      : {device}")
+    print(f"  Waiting for jobs from coordinator...")
+    print(f"{'='*60}\n")
+    try:
+        worker_loop(coord_url, token, host, port, device)
+    except KeyboardInterrupt:
+        print("\n  Worker stopped.")
+    close_server(srv)
 
 
 def inspector(run_dir: Path) -> None:
@@ -1178,45 +1345,25 @@ def inspector(run_dir: Path) -> None:
         if p.exists():
             print(f"\n--- {name} ---")
             print(p.read_text(encoding="utf-8"))
+    lb = run_dir / "leaderboard.json"
+    if lb.exists():
+        print(f"\n--- leaderboard ---")
+        print(lb.read_text(encoding="utf-8"))
     summ = run_dir / "RUN_SUMMARY.md"
     if summ.exists():
         print(f"\n{'─'*60}")
         print(summ.read_text(encoding="utf-8"))
 
 
-# ── CLI ────────────────────────────────────────────────────────────────
-def print_banner():
-    print("=" * 68)
-    print("  EXOSFEAR MicroGo KG Distributed")
-    print("  6x6 self-play lab · two graph-team players · LAN workers")
-    print(f"  Expert nodes per team: {', '.join(EXPERT_NAMES)}")
-    print("  Warning: can be compute-intensive. Start small.")
-    print("=" * 68)
-
-
-def parse_args():
-    ap = argparse.ArgumentParser(description="EXOSFEAR MicroGo KG Distributed")
-    ap.add_argument("--mode", choices=["coordinator", "worker", "inspect"],
-                    default=None, help="Skip interactive menu")
-    ap.add_argument("--run-dir", default="microgo_exosfear_kg_run")
-    ap.add_argument("--coord-url", default=None, help="Coordinator URL (worker mode)")
-    ap.add_argument("--token", default=None)
-    ap.add_argument("--host", default=None)
-    ap.add_argument("--port", type=int, default=None)
-    ap.add_argument("--device", default=None)
-    return ap.parse_args()
-
-
 def main():
     print_banner()
     args = parse_args()
 
-    # If --mode given on command line, skip interactive menu
     mode = args.mode
     if mode is None:
         print("\nChoose mode:")
-        print("  1) Coordinator  (run training, serve jobs)")
-        print("  2) Worker       (connect to coordinator, run self-play)")
+        print("  1) Coordinator  (start here first)")
+        print("  2) Worker       (start on other machines — auto-discovers coordinator)")
         print("  3) Inspect      (view results of a previous run)")
         choice = prompt_default("Select", "1")
         mode = {"1": "coordinator", "2": "worker", "3": "inspect"}.get(choice, "coordinator")
@@ -1226,29 +1373,7 @@ def main():
         coordinator_pipeline(cfg)
 
     elif mode == "worker":
-        coord_url = args.coord_url
-        if not coord_url:
-            wcfg = worker_wizard()
-        else:
-            wcfg = worker_wizard(coord_url)
-        # Override with CLI args if provided
-        if args.host: wcfg["host"] = args.host
-        if args.port: wcfg["port"] = args.port
-        if args.device: wcfg["device"] = args.device
-        if args.token: wcfg["token"] = args.token
-
-        srv = start_worker_health_server(wcfg["host"], wcfg["port"], wcfg["token"],
-            {"host": wcfg["host"], "port": wcfg["port"], "device": wcfg["device"], "role": "worker"})
-        print(f"\n  Worker running on http://{wcfg['host']}:{wcfg['port']}")
-        print(f"  Connecting to coordinator: {wcfg['coordinator_url']}")
-        print(f"  Device: {wcfg['device']}")
-        print(f"  Waiting for jobs...\n")
-        try:
-            worker_loop(wcfg["coordinator_url"], wcfg["token"],
-                        wcfg["host"], wcfg["port"], wcfg["device"])
-        except KeyboardInterrupt:
-            print("\n  Worker stopped.")
-        close_server(srv)
+        run_worker(args)
 
     else:
         run_dir = Path(args.run_dir)
