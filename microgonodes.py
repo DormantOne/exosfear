@@ -466,7 +466,18 @@ if not MOCK_MODE:
                 st=ns
             return st.winner()
         wa=sum(1 for _ in range(games//2) if pm(nets["A"],nets["B"])==1)+sum(1 for _ in range(games-games//2) if pm(nets["B"],nets["A"])==-1)
-        def vr(n,g=4):return round(sum(1 for _ in range(g) if (lambda:([st:=GoState.new()],[[st:=st.try_play(eval_move(n,dev,st,sims) if st.to_play==1 else random.choice(st.legal_moves())) or st for _ in range(999) if not st.game_over()],st.winner()][1][-1]))()[-1]==1)/g,3)
+        def vr(net,g=4):
+            wins=0
+            for _ in range(g):
+                st=GoState.new()
+                while not st.game_over():
+                    mv=eval_move(net,dev,st,sims) if st.to_play==1 else random.choice(st.legal_moves())
+                    ns=st.try_play(mv)
+                    if not ns:ns=st.try_play(PASS_MOVE)
+                    if not ns:break
+                    st=ns
+                if st.winner()==1:wins+=1
+            return round(wins/max(1,g),3)
         return{"games":games,"wins_A":wa,"wins_B":games-wa,"A_vs_random":vr(nets["A"],max(4,games//2)),"B_vs_random":vr(nets["B"],max(4,games//2))}
 
 class Leaderboard:
